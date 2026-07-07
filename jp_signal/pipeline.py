@@ -81,7 +81,8 @@ def morning_pipeline(as_of: date, cfg: dict) -> None:
             cfg["sizing"]["adv_ratio"],
             cfg["sizing"]["adv_ratio_cap"],
             unit=100,
-            short_unit_cap=cfg["sizing"]["short_unit_cap"],
+            market_open_unit_cap=cfg["sizing"]["market_open_unit_cap"],
+            is_market_open_order=True,
         )
         if qty == 0:
             continue

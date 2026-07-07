@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 venv/
 data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
 data/topix500.csv
 *.log
 .DS_Store

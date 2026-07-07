@@ -1,12 +1,17 @@
-"""バックテストエンジン（FR-BT-01〜05）。
+"""バックテストエンジン（FR-BT-01〜05）。改訂版。
+
+主な修正点（改訂前からの差分）:
+  1. エグジット（決済）にも反対売買のマーケットインパクトを適用（往復コスト計上）。
+  2. _get_future_row が (row, exit_date) を返し、exit 日の前日 ADV を分母に使用。
+  3. スプレッド/手数料フックを追加（デフォルト0だが将来拡張のため引数化）。
 
 約定・コストモデル:
-  - FR-BT-01: 買い指値 P は当日安値 <= P で約定、同値未約定（安値 < P で約定）。
+  - FR-BT-01: 買い指値 P は当日安値 < P で約定（同値未約定は保守仮定。感度分析を別途行うこと）。
               売り指値 P は当日高値 > P で約定（同値未約定）。
-  - FR-BT-02: 売買手数料 0。
-  - FR-BT-03: 信用金利/貸株料 年率2%（日次 = 2%/365）、オーバーナイト保有日数で計上、日計り0。
+  - FR-BT-02: 売買手数料はデフォルト0（commission_bp で変更可）。
+  - FR-BT-03: 信用金利/貸株料 年率2%（日次 = rate/365）、オーバーナイト保有日数で計上。
   - FR-BT-04: マーケットインパクト sqrt則 impact_bp = k * sqrt(order_value / adv)。
-              k のデフォルト 30bp は「adv比0.1%で~1bp、1%で~3bp、10%で~10bp」を与える較正例。
+              k はデータソース依存の較正値。yfinance 近似 turnover と JQuants 実測は別較正。
   - FR-BT-05: 売り戦略は shortability(is_margin_lendable=1 かつ short_restricted=0) の銘柄のみ。
 """
 
@@ -17,17 +22,21 @@ import pandas as pd
 
 
 class Backtester:
-    """日次シグナルを受け取り、約定・コストを反映して PnL を算出する。"""
+    """日次シグナルを受け取り、往復の約定・コストを反映して PnL を算出する。"""
 
     def __init__(
         self,
         impact_k_bp: float = 30.0,
         annual_interest_rate: float = 0.02,
         annual_lending_rate: float = 0.02,
+        commission_bp: float = 0.0,
+        half_spread_bp: float = 0.0,
     ):
         self.k = impact_k_bp
         self.daily_int = annual_interest_rate / 365.0
         self.daily_lend = annual_lending_rate / 365.0
+        self.commission_bp = commission_bp
+        self.half_spread_bp = half_spread_bp
 
     # ------------------------------------------------------------ fill models
     @staticmethod
@@ -47,14 +56,24 @@ class Backtester:
             return 0.0
         return self.k * float(np.sqrt(order_value / adv))
 
-    def _apply_impact(self, price: float, order_value: float, adv: float, direction: int) -> float:
-        """インパクトを価格に反映する。買い(direction=+1)は不利側=上振れ、売りは下振れ。"""
-        bp = self.market_impact_bp(order_value, adv)
+    def _slippage_bp(self, order_value: float, adv: float) -> float:
+        """1回の約定にかかる不利方向スリッページ(bp) = インパクト + ハーフスプレッド + 手数料。"""
+        return (
+            self.market_impact_bp(order_value, adv)
+            + self.half_spread_bp
+            + self.commission_bp
+        )
+
+    def _apply_slippage(
+        self, price: float, order_value: float, adv: float, direction: int
+    ) -> float:
+        """不利側に価格を寄せる。買い(direction=+1)は上振れ、売り(direction=-1)は下振れ。"""
+        bp = self._slippage_bp(order_value, adv)
         return price * (1.0 + direction * bp / 10000.0)
 
     # --------------------------------------------------------------- helpers
     def _prev_turnover(self, px: pd.DataFrame, code: str, d) -> float:
-        """d より前の直近営業日の売買代金（ADV近似）。"""
+        """d より前の直近営業日の売買代金（ADV近似）。存在しなければ 0。"""
         try:
             g = px.loc[code]
         except KeyError:
@@ -65,18 +84,20 @@ class Backtester:
         return float(prev.iloc[-1]["turnover"])
 
     def _get_future_row(self, px: pd.DataFrame, code: str, d, holding_days: int):
-        """d から holding_days 営業日後の行を返す（データ末尾を超えたら None）。"""
+        """d から holding_days 営業日後の (行, その日付) を返す。末尾超えは (None, None)。"""
         try:
             g = px.loc[code]
         except KeyError:
-            return None
+            return None, None
         fut = g.loc[g.index > d]
         if len(fut) < holding_days:
-            return None
-        return fut.iloc[holding_days - 1]
+            return None, None
+        exit_row = fut.iloc[holding_days - 1]
+        exit_date = fut.index[holding_days - 1]
+        return exit_row, exit_date
 
-    def _exec_price(self, row, sig, adv: float, side_sign: int):
-        """約定価格を返す。約定しない場合は None。"""
+    def _entry_price(self, row, sig, adv: float, side_sign: int):
+        """エントリー約定価格を返す。約定しない場合は None。"""
         order_type = sig.get("order_type", "MKT_OPEN")
         qty = sig.get("qty", 0)
 
@@ -98,7 +119,7 @@ class Backtester:
             base = row["open"]
 
         order_value = base * qty
-        return self._apply_impact(base, order_value, adv, direction=side_sign)
+        return self._apply_slippage(base, order_value, adv, direction=side_sign)
 
     # ------------------------------------------------------------------- run
     def run(
@@ -137,7 +158,7 @@ class Backtester:
             row = px.loc[(code, d)]
             adv = self._prev_turnover(px, code, d)
 
-            # 売り可否チェック（FR-BT-05）
+            # 売り可否チェック（FR-BT-05）。データ欠損時は保守側=売り不可。
             if s["side"] == "SELL":
                 shortable = (
                     sh is not None
@@ -150,24 +171,30 @@ class Backtester:
                     continue
 
             side_sign = 1 if s["side"] == "BUY" else -1
-            entry = self._exec_price(row, s, adv, side_sign)
+            entry = self._entry_price(row, s, adv, side_sign)
             if entry is None:
                 results.append({**s.to_dict(), "status": "NO_FILL"})
                 continue
 
             holding_days = int(s.get("holding_days", 1))
-            exit_row = self._get_future_row(px, code, d, holding_days)
+            exit_row, exit_date = self._get_future_row(px, code, d, holding_days)
             if exit_row is None:
                 results.append({**s.to_dict(), "status": "NO_EXIT_DATA"})
                 continue
-            exit_price = float(exit_row["close"])
 
-            # 金利/貸株（1株あたり）
+            qty = s["qty"]
+            # 決済は反対売買。exit 日の前日 ADV を分母に使う。
+            exit_base = float(exit_row["close"])
+            exit_adv = self._prev_turnover(px, code, exit_date)
+            exit_price = self._apply_slippage(
+                exit_base, exit_base * qty, exit_adv, direction=-side_sign
+            )
+
+            # 金利/貸株（1株あたり、エントリー価格ベース）
             carry_rate = self.daily_lend if s["side"] == "SELL" else self.daily_int
             carry_cost = entry * carry_rate * holding_days
 
-            direction = 1 if s["side"] == "BUY" else -1
-            qty = s["qty"]
+            direction = side_sign
             gross = (exit_price - entry) * direction * qty
             pnl = gross - carry_cost * qty
 
