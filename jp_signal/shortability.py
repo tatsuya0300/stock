@@ -32,20 +32,28 @@ class ShortabilityProvider:
             "日証金の公開データ仕様に合わせて実装する（https://www.jsf.co.jp/）"
         )
 
-    def provisional_snapshot(self, codes: list[str], today: date) -> pd.DataFrame:
+    def provisional_snapshot(
+        self, codes: list[str], today: date, assume_shortable: bool = False
+    ) -> pd.DataFrame:
         """MVP向けの暫定スナップショット。
 
-        TOPIX500は概ね貸借銘柄との前提で is_margin_lendable=1 とし、
-        short_restricted は保守側(1=売り不可)ではなく "取得済みで制限なし" を
-        表す 0 を置く。実運用では snapshot_today() で置き換えること。
+        TOPIX500は概ね貸借銘柄との前提で is_margin_lendable=1 とする。
+
+        assume_shortable=False（デフォルト）: short_restricted=1（売り不可）に倒し、
+            売り戦略PnLの保守的下限を推定する。実データが無い間はこちらが安全側。
+        assume_shortable=True: 開発時の疎通確認用に楽観的に売り可能（short_restricted=0）
+            とする。実運用・実データ検証では使用しないこと。
+
         本メソッドはあくまで開発・検証用であり、実際の売り可否を保証しない。
+        実運用では snapshot_today() で置き換えること。
         """
         d = today.strftime("%Y-%m-%d")
+        restricted = 0 if assume_shortable else 1
         return pd.DataFrame(
             {
                 "code": codes,
                 "date": [d] * len(codes),
                 "is_margin_lendable": [1] * len(codes),
-                "short_restricted": [0] * len(codes),
+                "short_restricted": [restricted] * len(codes),
             }
         )[SHORT_COLS]

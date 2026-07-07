@@ -45,14 +45,18 @@ class MeanReversionRule(SignalModel):
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values(["code", "date"])
 
+        # リターン計算は分割・配当調整済みの adj_close を使う。
+        # 旧スキーマ（adj_close 無し）でも動くよう close にフォールバック。
+        price_col = "adj_close" if "adj_close" in df.columns else "close"
+
         # 各銘柄について lookback 日リターンを算出
         rets: dict[str, float] = {}
         for code, g in df.groupby("code"):
             g = g.tail(self.lookback + 1)
             if len(g) < self.lookback + 1:
                 continue
-            first = g["close"].iloc[0]
-            last = g["close"].iloc[-1]
+            first = g[price_col].iloc[0]
+            last = g[price_col].iloc[-1]
             if first and first > 0:
                 rets[code] = (last / first) - 1.0
 
