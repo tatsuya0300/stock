@@ -1,0 +1,21 @@
+data:
+  source: "yfinance"          # "yfinance" | "jquants"
+  db_path: "./data/jp_signal.sqlite"
+  jquants_refresh_token: ""   # 本番のみ
+universe:
+  file: "./data/topix500.csv" # code,name の2列
+backtest:
+  start: "2022-01-01"
+  end:   "2024-12-31"
+  impact_k_bp: 30.0           # sqrt則の較正係数
+  annual_interest_rate: 0.02  # 信用金利 年率2%
+  short_lending_rate:   0.02  # 貸株料 年率2%
+sizing:
+  adv_ratio: 0.001            # 前日代金0.1%
+  adv_ratio_cap: 0.002        # 上限0.2%
+  short_unit_cap: 50          # 寄り成り上限50単元
+notify:
+  channel: "console"          # "console" | "discord" | "slack"
+  discord_webhook: ""
+  morning_time: "08:15"
+  closing_time: "15:00"
