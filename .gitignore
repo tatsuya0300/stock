@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+data/*.sqlite
+data/topix500.csv
+*.log
+.DS_Store
