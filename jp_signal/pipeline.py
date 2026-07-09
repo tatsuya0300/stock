@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 
@@ -104,6 +105,17 @@ def morning_pipeline(
     codes = univ["code"].tolist()
     notifier = make_notifier(cfg)
 
+    # yfinance 近似の再警告（本番誤用防止）
+    if cfg.get("data", {}).get("source") == "yfinance":
+        log.warning(
+            "data.source=yfinance: turnover は近似。本番は jquants に切替推奨。"
+        )
+    if not cfg.get("backtest", {}).get("impact_k_is_calibrated", False):
+        log.info(
+            "impact_k_bp=%.1f は未較正（impact_k_is_calibrated=false）",
+            float(cfg.get("backtest", {}).get("impact_k_bp", 30.0)),
+        )
+
     try:
         df = _fetch_prices_incremental(ds, storage, codes, as_of, dry_run=dry_run)
         if df.empty:
@@ -175,4 +187,68 @@ def morning_pipeline(
 
     finally:
         if not dry_run and storage is not None:
+            storage.close()
+
+
+def closing_pipeline(
+    as_of: date,
+    cfg: dict,
+    fills_csv: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """引け後処理。
+
+    1) 当日 orders の再通知（確認用）
+    2) 任意の fills CSV を DB へ取込（FR-RECORD 最小実装）
+    3) 当日 fills 件数を通知
+
+    fills CSV 列: trade_date,code,side,qty,price[,note,run_id]
+    """
+    if not is_tse_business_day(as_of):
+        log.info("non-business day: %s", as_of)
+        return {"orders": 0, "fills_imported": 0}
+
+    storage: Storage | None = Storage(cfg["data"]["db_path"]) if not dry_run else None
+    notifier = make_notifier(cfg)
+    as_of_s = str(as_of)
+    result = {"orders": 0, "fills_imported": 0}
+
+    try:
+        orders_df = pd.DataFrame()
+        if storage is not None:
+            orders_df = storage.load_orders(order_date=as_of_s)
+            result["orders"] = len(orders_df)
+
+        if orders_df.empty:
+            body = "当日注文なし（または DB 未接続）"
+        else:
+            body = format_orders(orders_df)
+
+        title_prefix = "[DRY-RUN] " if dry_run else ""
+        notifier.send(f"{title_prefix}引け後確認 {as_of}", body)
+
+        # fills 取込
+        if fills_csv is not None and storage is not None and not dry_run:
+            n = storage.import_fills_csv(fills_csv)
+            result["fills_imported"] = n
+            fills_today = storage.load_fills(trade_date=as_of_s)
+            notifier.send(
+                f"実績取込 {as_of}",
+                f"CSV取込: {n}件\n当日fills: {len(fills_today)}件",
+            )
+        elif fills_csv is not None and dry_run:
+            path = Path(fills_csv)
+            n_lines = 0
+            if path.exists():
+                # ヘッダ除く概算
+                n_lines = max(sum(1 for _ in path.open(encoding="utf-8")) - 1, 0)
+            result["fills_imported"] = n_lines
+            notifier.send(
+                f"[DRY-RUN] 実績取込 {as_of}",
+                f"CSV行数(概算): {n_lines}",
+            )
+
+        return result
+    finally:
+        if storage is not None:
             storage.close()

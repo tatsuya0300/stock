@@ -28,6 +28,43 @@ def test_is_shortable_no_lookahead():
     assert is_shortable_asof(sh2, "7203", "2024-01-11") is False
 
 
+def test_signals_to_orders_includes_name_for_live():
+    """live モードでも name が付与されることを確認（#6 回帰防止）。"""
+    prices = pd.DataFrame(
+        [
+            {
+                "code": "7203", "date": "2024-01-09",
+                "open": 100, "high": 110, "low": 90,
+                "close": 100, "adj_close": 100, "volume": 1e6, "turnover": 1e10,
+            },
+            {
+                "code": "7203", "date": "2024-01-10",
+                "open": 100, "high": 110, "low": 90,
+                "close": 105, "adj_close": 105, "volume": 1e6, "turnover": 1e10,
+            },
+        ]
+    )
+    sig = pd.DataFrame([{"code": "7203", "side": "BUY", "score": 1.0, "limit_price": None}])
+    univ = pd.DataFrame([{"code": "7203", "name": "トヨタ"}])
+    risk = RiskConfig(allow_short_without_confirmed_shortability=True)
+    orders = signals_to_orders(
+        sig,
+        prices,
+        as_of="2024-01-11",
+        sizing_cfg={"adv_ratio": 0.001, "adv_ratio_cap": 0.002, "market_open_unit_cap": 50},
+        risk_cfg=risk,
+        universe=univ,
+        for_backtest=False,
+    )
+    assert not orders.empty, "orders should not be empty"
+    assert "name" in orders.columns, "name column must exist"
+    assert orders.iloc[0]["name"] == "トヨタ", f"expected トヨタ, got {orders.iloc[0]['name']}"
+
+    # for_backtest=False でも date/limit_price/holding_days が無いこと
+    assert "date" not in orders.columns or orders["date"].isna().all()
+    assert "limit_price" not in orders.columns or orders["limit_price"].isna().all()
+
+
 def test_signals_to_orders_drops_unshortable_sell():
     prices = pd.DataFrame(
         [

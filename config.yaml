@@ -13,7 +13,8 @@ model:
 backtest:
   start: "2022-01-01"
   end:   "2024-12-31"
-  impact_k_bp: 30.0
+  impact_k_bp: 30.0    # 未較正（impact_k_is_calibrated=false）。パラメータサーチで調整のこと。
+  impact_k_is_calibrated: false
   annual_interest_rate: 0.02
   short_lending_rate: 0.02
   adv_window: 20
