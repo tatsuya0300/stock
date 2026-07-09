@@ -52,19 +52,24 @@ def validate_prices(
             raise ValueError(f"Missing required column: {c}")
 
     # Validate high >= low
-    valid_high_low = True
+    valid_high_low: pd.Series | bool = True
     if "high" in df.columns and "low" in df.columns:
         valid_high_low = df["high"] >= df["low"]
     if "adj_high" in df.columns and "adj_low" in df.columns:
-        valid_high_low = valid_high_low & (df["adj_high"] >= df["adj_low"])
+        if isinstance(valid_high_low, bool):
+            valid_high_low = df["adj_high"] >= df["adj_low"]
+        else:
+            valid_high_low = valid_high_low & (df["adj_high"] >= df["adj_low"])
 
-    invalid = ~valid_high_low
-
-    if invalid.any():
-        if strict:
-            raise ValueError(
-                f"Found {invalid.sum()} rows with high < low"
-            )
-        df = df[~invalid]
+    if isinstance(valid_high_low, pd.Series):
+        invalid = ~valid_high_low
+        if invalid.any():
+            if strict:
+                raise ValueError(
+                    f"Found {invalid.sum()} rows with high < low"
+                )
+            df = df[~invalid]
+    elif strict and not valid_high_low:
+        raise ValueError("Found rows with high < low (detected at bool level)")
 
     return df[required].copy()

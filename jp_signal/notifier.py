@@ -16,6 +16,8 @@ COMPLIANCE_FOOTER = (
     "※最終的な投資判断はご自身の責任で行ってください。売買を推奨するものではありません。"
 )
 
+DISCORD_MAX_LENGTH = 2000
+
 
 class Notifier(ABC):
     """通知送信インターフェース。"""
@@ -33,7 +35,7 @@ class ConsoleNotifier(Notifier):
 
 
 class DiscordNotifier(Notifier):
-    """Discord Webhook への通知。"""
+    """Discord Webhook への通知。長文は分割送信する。"""
 
     def __init__(self, webhook_url: str):
         self.url = webhook_url
@@ -41,16 +43,41 @@ class DiscordNotifier(Notifier):
     def send(self, title: str, body: str) -> None:
         import requests
 
-        r = requests.post(
-            self.url,
-            json={"content": f"**{title}**\n\n{body}"},
-            timeout=15,
-        )
-        r.raise_for_status()
+        chunks = _split_text(body, DISCORD_MAX_LENGTH)
+        for i, chunk in enumerate(chunks):
+            t = f"{title} ({i+1}/{len(chunks)})" if len(chunks) > 1 else title
+            r = requests.post(
+                self.url,
+                json={"content": f"**{t}**\n\n{chunk}"},
+                timeout=15,
+            )
+            r.raise_for_status()
+
+
+def _split_text(text: str, max_len: int) -> list[str]:
+    """max_len を超えるテキストを改行単位で分割する。"""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > max_len:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def format_orders(orders: pd.DataFrame) -> str:
     """FR-NOTIFY-06: 1銘柄1行の読みやすい書式で発注指示を整形する。"""
+    if orders.empty:
+        return f"注文なし\n\n{COMPLIANCE_FOOTER}"
+
     lines = []
     for _, o in orders.iterrows():
         side = "買" if o["side"] == "BUY" else "売"
