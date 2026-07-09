@@ -1,110 +1,212 @@
 # jp_signal — 日本株シグナル生成 + バックテスト MVP
 
-要件定義書のうち **FR-DATA（データ取得基盤）** と **FR-BT（バックテスト）** の最小実装（MVP）。
-FR-NOTIFY は後段でアダプタを差し替える設計（`ConsoleNotifier` 先行実装）。
+要件定義書のうち **FR-DATA（データ取得基盤）** と **FR-BT（バックテスト）** の最小実装（MVP）。  
+FR-NOTIFY はアダプタ差し替え設計（`ConsoleNotifier` 先行、Discord 対応済み）。
+
+### 重要
+
+本リポジトリは「発注指示の生成・通知」までを対象とする。自動発注・投資助言ではない。  
+`MeanReversionRule` は動作確認用ダミーであり、収益性を保証しない。
 
 ## 設計方針
 
-1. **言語/構成**: Python 3.11+ / モジュール分割 / 型ヒント付き。依存は最小（pandas, numpy, requests, pyyaml, python-dateutil, jpholiday, yfinance）。
-2. **データソース**: プロトタイプは `yfinance`、本番は `JQuantsSource`（同一インターフェース `PriceDataSource`）で差し替え可能。
-3. **売り可否（FR-DATA-04）**: 日証金は最新スナップショットのみ取得可のため、日次スナップショットを蓄積してヒストリカル化。過去分は「不明扱い」で売り戦略BTから除外。
-4. **BT約定モデル（FR-BT-01）**: 買い指値 P → 当日安値 < P で約定（同値未約定）。売り指値 P → 当日高値 > P で約定。
-5. **マーケットインパクト（FR-BT-04）**: `impact_bp = k * sqrt(order_value / adv)` の平方根則。`config.yaml` の `impact_k_bp` で較正。**エントリーとエグジットの両方**に反対売買コストを計上（往復）。エグジットの分母には決済日前日のADVを使用。手数料 `commission_bp`・ハーフスプレッド `half_spread_bp` も引数化（既定0）。
-6. **信用金利/貸株料（FR-BT-03）**: 年率2%（日次 = 2%/365）、オーバーナイト保有日数で計上、日計り0。
-7. **通知（FR-NOTIFY）**: アダプタパターン。`ConsoleNotifier` 先行、Discord/Slack/メールは同一IFで後付け。
-8. **ハルシネーション回避**: JQuants の詳細仕様は変動しうるため、確認箇所をコード内コメントで明示。yfinance は動作確認済みAPIのみ使用。
+1. **言語/構成**: Python 3.11+ / モジュール分割 / 型ヒント。依存は最小。
+2. **データソース**: プロトタイプは `yfinance`、本番は `JQuantsSource`（同一 IF `PriceDataSource`）。
+3. **売り可否（FR-DATA-04）**: 日証金は最新スナップショットのみのため日次蓄積が必要。  
+   現状 `snapshot_today()` は未実装。未確認売りはデフォルトで出さない。
+4. **BT約定モデル（FR-BT-01）**: 買い指値 P → 当日安値 < P。
+5. **マーケットインパクト（FR-BT-04）**: `impact_bp = k * sqrt(order_value / adv)`。エントリー/エグジット往復計上。
+6. **信用金利/貸株料（FR-BT-03）**: 年率設定値を /365 で日次化。
+7. **通知（FR-NOTIFY）**: Console / Discord アダプタ。
+8. **look-ahead 回避**: 寄前は前営業日までの価格のみ使用。
 
 ### 一次情報
 
-- JQuants API 仕様: https://jpx.gitbook.io/j-quants-ja
-- 日本証券金融（貸借銘柄・制限措置）: https://www.jsf.co.jp/
+- JQuants API: https://jpx.gitbook.io/j-quants-ja / https://jpx-jquants.com/en/spec/eq-bars-daily
+- 日本証券金融: https://www.jsf.co.jp/
 - 東証 売買制度: https://www.jpx.co.jp/rules-participants/rules/regulations/
+- TOPIX 指数: https://www.jpx.co.jp/markets/indices/topix/
 - yfinance: https://github.com/ranaroussi/yfinance
 
-## ディレクトリ構成
+## ディレクトリ構成（現行）
 
 ```
-webapp/
+.
+├── .github/workflows/ci.yml   # CI（ruff + mypy + pytest）
 ├── config.yaml
-├── requirements.txt
 ├── main.py
-├── scripts/
-│   └── run_backtest.py
+├── pyproject.toml
+├── requirements.txt
+├── requirements-dev.txt
+├── README.md
 ├── data/
-│   └── topix500_sample.csv   # 動作確認用サンプル
+│   └── topix500_sample.csv    # 動作確認用サンプル（デフォルト）
+├── scripts/
+│   ├── run_backtest.py
+│   ├── build_pit_universe_from_events.py
+│   ├── build_universe_from_jpx_weights.py
+│   └── import_fills.py
+├── tests/
 └── jp_signal/
     ├── __init__.py
-    ├── calendar.py       # 祝日・営業日判定
-    ├── datasource.py     # PriceDataSource + yfinance/JQuants 実装
-    ├── shortability.py   # 売り可否（日証金）スナップショット管理
-    ├── storage.py        # SQLite 永続化
-    ├── universe.py       # TOPIX500 ユニバース管理
-    ├── model.py          # シグナル生成モデル（ルールベース差替可）
-    ├── sizing.py         # 執行サイズ算定
-    ├── backtest.py       # バックテストエンジン
-    ├── notifier.py       # 通知アダプタ
-    └── pipeline.py       # 日次パイプライン統合
+    ├── calendar.py
+    ├── config.py
+    ├── data_quality.py
+    ├── datasource.py
+    ├── shortability.py
+    ├── storage.py
+    ├── universe.py
+    ├── model.py
+    ├── sizing.py
+    ├── risk.py
+    ├── order_builder.py
+    ├── backtest.py
+    ├── metrics.py
+    ├── notifier.py
+    └── pipeline.py
 ```
 
-## 使い方（MVP）
+## セットアップ
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-mkdir -p data
-# data/topix500.csv を用意（JPX公式のTOPIX500構成銘柄, code,name）
-#   動作確認だけなら config.yaml の universe.file を data/topix500_sample.csv に向ける
-python main.py
+pip install -r requirements-dev.txt   # 開発時
 ```
 
-初回は yfinance から過去データを取得するため時間を要します。
-cron / タスクスケジューラで平日 8:15 に `python main.py` を実行すると
-`ConsoleNotifier` に発注指示が出ます。Discord へ切替は `config.yaml` の
-`notify.channel: "discord"` と `discord_webhook` を設定するだけです。
+## ユニバース CSV
+
+| 用途 | ファイル | 設定 |
+|---|---|---|
+| 動作確認（デフォルト） | `data/topix500_sample.csv` | `universe.file: ./data/topix500_sample.csv` |
+| 本格BT/運用 | `data/topix500.csv`（自前配置） | `universe.file: ./data/topix500.csv` |
+
+### data/topix500.csv の用意手順（本格利用時）
+
+1. JPX の TOPIX 系指数ページから構成銘柄（またはウェイトファイル）を取得  
+   https://www.jpx.co.jp/markets/indices/topix/
+2. 最低限 `code,name` の CSV を作成（証券コードは 4 桁想定）
+3. 可能なら point-in-time 用に `effective_from,effective_to` を付与
+4. `config.yaml` の `universe.file` を `./data/topix500.csv` に変更
+
+**補助スクリプト:**
+- `scripts/build_universe_from_jpx_weights.py`
+- `scripts/build_pit_universe_from_events.py`（生存者バイアス対策の土台）
+
+## 使い方
+
+### 寄前パイプライン
+
+```bash
+python main.py
+# または
+python main.py morning
+python main.py morning --dry-run
+python main.py morning --date 2026-07-09
+```
+
+### 引け後
+
+```bash
+python main.py closing
+python main.py closing --fills data/fills_YYYY-MM-DD.csv
+```
 
 ### バックテスト
 
 ```bash
+# 事前に価格データを DB へ取り込む（main.py 実行など）
 python scripts/run_backtest.py
 ```
 
-## 要件充足マッピング
+## データソース切替
+
+| 項目 | yfinance（試作） | jquants（本番） |
+|---|---|---|
+| `data.source` | `yfinance` | `jquants` |
+| 認証 | 不要 | 環境変数 `JQUANTS_API_KEY` |
+| turnover | 近似 close*volume | 真値（Va/TurnoverValue） |
+| sizing/impact | デフォルト拒否 | 利用可 |
+
+### yfinance のまま sizing/impact を走らせる（非推奨・疎通確認のみ）:
+
+```yaml
+data:
+  source: "yfinance"
+  allow_approximate_turnover: true
+```
+
+### 本番例:
+
+```bash
+export JQUANTS_API_KEY=...   # V2 API Key
+# config.yaml:
+#   data.source: "jquants"
+python main.py morning
+```
+
+### Discord 通知:
+
+```bash
+export DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+# config.yaml: notify.channel: "discord"
+```
+
+## 運用ルール（P0 強制）
+
+1. **shortability 未実装のまま売りを出さない**  
+   - `risk.allow_short_without_confirmed_shortability: false`（デフォルト）  
+   - shortability データが空なら売りは全除外  
+   - 開発で売りを通す場合のみ明示的に `true`（本番禁止）
+
+2. **yfinance を本番 sizing/impact に使わない**  
+   - `allow_approximate_turnover: false`（デフォルト）で hard fail  
+   - 本番は `jquants`
+
+3. **impact_k 未較正の PnL を過信しない**  
+   - `impact_k_is_calibrated: false` の間は研究用
+
+4. **自動執行しない**  
+   - 通知は参考情報。最終判断・発注は人間
+
+## 要件充足マッピング（要約）
 
 | 要件ID | 実装箇所 | 備考 |
 |---|---|---|
 | FR-DATA-01/03/05 | datasource.py, storage.py | yfinance/JQuants 切替可 |
-| FR-DATA-02 | JQuantsSource 注記 | 直近2週間除外は取得側で日付制限 |
-| FR-DATA-04 | shortability.py | スケルトン（一次情報要確認） |
-| FR-UNIV-01/02/03 | universe.py, pipeline.py | TOPIX500 想定 |
-| FR-MODEL-01/02/04 | model.py | ML は同IFで差替可 |
-| FR-BT-01〜05 | backtest.py | インパクトは sqrt則で較正可 |
-| FR-SIZE-01/02 | sizing.py | 50単元超は警告文字列で通知 |
-| FR-NOTIFY-01〜06 | notifier.py, pipeline.py | Console/Discord アダプタ |
-| FR-COMP | notifier.py: COMPLIANCE_FOOTER | 定型文で常時付与 |
-| NFR-OPS | calendar.py | jpholiday 使用 |
-
-## 改訂履歴（本コミットの主な修正）
-
-- **往復コスト**: バックテストのエグジットにも反対売買のマーケットインパクトを計上。決済日前日のADVを分母に使用。手数料・ハーフスプレッドを引数化。
-- **分割調整**: 価格スキーマに `adj_close`（分割・配当調整後終値）を追加。リターン計算は `adj_close`、約定金額は生 `open/close` を使用（分割バグ対策）。旧スキーマは `close` にフォールバック。
-- **サイズ算定**: `target_notional` を引数化し `adv_ratio_cap` を真の上限として機能させた。`short_unit_cap` → `market_open_unit_cap` に改名（寄成注文時のみ警告）。
-- **売り可否**: `provisional_snapshot` の既定を保守側（売り不可）に変更。`assume_shortable=True` は開発用のみ。
-- **JQuants**: `pagination_key` ループ・`idToken` 有効期限管理・指数バックオフ付きリトライを追加。※列名/キー名は公式ドキュメントで要確認。
-- **永続化**: 固定名ステージングテーブルを廃し `executemany`+トランザクション化。`check_same_thread=False`/WAL でスレッド安全化。
-- **品質**: `tests/`（backtest/sizing の回帰テスト）と `.github/workflows/ci.yml`（ruff+mypy+pytest）、`pyproject.toml` を追加。
+| FR-DATA-04 | shortability.py | スケルトン（未実装） |
+| FR-UNIV-01/02/03 | universe.py | PIT列対応（データ次第） |
+| FR-MODEL-01/02/04 | model.py | ダミールール |
+| FR-BT-01〜06 | backtest.py, metrics.py | 往復コスト対応 |
+| FR-SIZE-01/02 | sizing.py | adv cap 対応 |
+| FR-RISK | risk.py, order_builder.py | 未確認売り除外 |
+| FR-NOTIFY | notifier.py, pipeline.py | Console/Discord |
+| NFR-OPS | calendar.py | jpholiday |
 
 ## 明示的な弱点（忖度なし）
 
-1. `shortability.py` は本実装未了。日証金の公開データフォーマット確認が必要。埋まるまで売り戦略BTは信頼できない（既定は保守的に売り不可扱い）。
-2. yfinance の turnover は `close*volume` の近似。本番は必ず JQuants の `TurnoverValue` を使用。
-3. `MeanReversionRule` は動作確認用ダミー。収益性は担保しない。実運用前に必ず BT で検証。
-4. JQuants のエンドポイント名・列名（`AdjustmentClose` 等）・`pagination_key` というキー名・`idToken` 有効期限は記憶ベースの推定を含む。`JQuantsSource` は公式ドキュメント（https://jpx.gitbook.io/j-quants-ja）で最新版を確認してから本番接続すること。
-5. インパクト係数 `k=30bp` は較正例。実測値が溜まるまで暫定値。
-6. **生存者バイアス**: 未対応。各営業日時点のTOPIX500構成（point-in-time メンバー）を別途保持する必要があり、コード修正だけでは解消しない（データ設計変更が前提）。
-7. 本改訂は「バックテストの正しさ」を高めるもので収益性を保証しない。往復コスト計上により、従来より PnL が悪化する（＝過大評価が是正される）ことが予想される。
+1. `shortability.py` 本実装未了。売り戦略BT/運用は信頼できない。
+2. yfinance turnover は近似。本番は JQuants 必須。
+3. `MeanReversionRule` はダミー。収益性なし。
+4. JQuants の列名・ページング等は公式仕様の再確認が必要。
+5. `impact_k_bp` は未較正。
+6. 生存者バイアス: point-in-time ユニバース実データが無いと未解消。
+7. 本改訂は正しさ向上が目的であり、収益性を保証しない。
+
+## 開発
+
+```bash
+ruff check .
+mypy jp_signal --ignore-missing-imports
+pytest -q
+```
+
+CI: `.github/workflows/ci.yml`（push / pull_request）
 
 ## 次の着手候補
 
-1. `data/topix500.csv` を用意し yfinance で日足を取り込み、1年分を BT → PnL・約定率・スリッページ分布を確認
-2. `shortability.py` の日証金取り込み実装（一次情報確認要）
-3. `DiscordNotifier` の実運用配線と cron スケジュール
-4. FR-RECORD の実績入力（最小 CSV 追記でも可）
+1. `data/topix500.csv`（可能なら PIT）を用意し JQuants で BT
+2. `shortability.py` の日証金取り込み本実装
+3. fills から realized slippage を推定し `impact_k` を較正
+4. ダミーモデル置換と walk-forward 評価

@@ -2,9 +2,19 @@ data:
   source: "yfinance"          # "yfinance" | "jquants"
   db_path: "./data/jp_signal.sqlite"
   # 秘密情報は環境変数 JQUANTS_API_KEY / DISCORD_WEBHOOK で設定推奨
+  #
+  # yfinance は turnover=close*volume の近似。
+  # 本番の sizing / market impact には使わないこと。
+  # yfinance のまま本番相当処理を走らせるには
+  # allow_approximate_turnover: true が必要（非推奨）。
+  allow_approximate_turnover: false
 
 universe:
-  file: "./data/topix500.csv" # 推奨: code,name,effective_from,effective_to
+  # 動作確認用サンプルをデフォルトにする。
+  # 本番/本格BT前に JPX 公式 TOPIX500 構成を data/topix500.csv へ置き、
+  # 下記を ./data/topix500.csv に変更すること。
+  # 推奨列: code,name[,effective_from,effective_to]
+  file: "./data/topix500_sample.csv"
 
 model:
   lookback: 5
@@ -22,6 +32,8 @@ backtest:
   commission_bp: 0.0
   half_spread_bp: 0.0
   output_dir: "./data/bt_out"
+  # true のとき shortability 未確認の売りを BT でも許可（開発専用）
+  allow_unconfirmed_short_in_bt: false
 
 sizing:
   adv_ratio: 0.001
@@ -35,6 +47,7 @@ risk:
   max_single_name_exposure_yen: 20000000
   max_long_exposure_yen: 100000000
   max_short_exposure_yen: 100000000
+  # 本番デフォルト: false（shortability 未確認の売りを出さない）
   allow_short_without_confirmed_shortability: false
 
 notify:

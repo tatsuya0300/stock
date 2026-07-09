@@ -1,6 +1,10 @@
 """バックテスト実行スクリプト。
 
 使い方: python scripts/run_backtest.py
+
+P0:
+  - yfinance 近似 turnover 利用時は hard fail（明示オプトイン以外）
+  - shortability 未確認売りはデフォルト除外
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ import pandas as pd
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from jp_signal.backtest import Backtester
-from jp_signal.config import load_config
+from jp_signal.config import guard_approximate_turnover, load_config
 from jp_signal.metrics import summarize_backtest
 from jp_signal.model import MeanReversionRule
 from jp_signal.order_builder import signals_to_orders
@@ -24,6 +28,16 @@ from jp_signal.universe import load_universe
 
 def main() -> None:
     cfg = load_config()
+
+    # P0: 近似 turnover で impact/sizing を使う BT を拒否
+    guard_approximate_turnover(cfg, context="run_backtest")
+
+    if not cfg.get("backtest", {}).get("impact_k_is_calibrated", False):
+        print(
+            "[WARN] impact_k_is_calibrated=false: "
+            "インパクト係数は未較正です。PnL を過信しないでください。"
+        )
+
     with Storage(cfg["data"]["db_path"]) as st:
         univ_all = load_universe(cfg["universe"])
         codes = univ_all["code"].tolist()
@@ -38,12 +52,33 @@ def main() -> None:
             print("価格データが空です。先に main.py 等で DB へ取り込んでください。")
             return
 
+        if short.empty:
+            print(
+                "[WARN] shortability データが空です。"
+                " 売りは SKIP_NOT_SHORTABLE になります"
+                "（allow_unconfirmed_short_in_bt / "
+                "allow_short_without_confirmed_shortability が true の場合を除く）。"
+            )
+
         model = MeanReversionRule(
             lookback=int(cfg.get("model", {}).get("lookback", 5)),
             top_n=int(cfg.get("model", {}).get("top_n", 5)),
         )
         holding_days = int(cfg["backtest"].get("holding_days", 1))
+
+        # BT 用 short ポリシー:
+        # - デフォルトは live と同じく未確認売り禁止
+        # - 開発時のみ backtest.allow_unconfirmed_short_in_bt=true
         risk_cfg = risk_config_from_dict(cfg.get("risk", {}))
+        if cfg.get("backtest", {}).get("allow_unconfirmed_short_in_bt", False):
+            risk_cfg.allow_short_without_confirmed_shortability = True
+            print(
+                "[WARN] allow_unconfirmed_short_in_bt=true: "
+                "BT で shortability 未確認売りを許可します（開発専用）。"
+            )
+        else:
+            risk_cfg.allow_short_without_confirmed_shortability = False
+
         all_dates = sorted(prices["date"].unique())
 
         signal_frames: list[pd.DataFrame] = []

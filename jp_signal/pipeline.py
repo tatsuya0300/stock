@@ -8,6 +8,10 @@ v2 変更点:
   - order_builder.signals_to_orders に注文生成を一元化（live/BT 同一ロジック）
   - 価格取得を差分更新に（storage に日付が揃っている分は再取得しない）
   - storage の context manager 使用
+
+P0:
+  - yfinance 近似 turnover の sizing/impact 利用をガード
+  - shortability 未確認売りは risk 設定で禁止（デフォルト）
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from pathlib import Path
 import pandas as pd
 
 from .calendar import is_tse_business_day
+from .config import enforce_short_policy_for_live, guard_approximate_turnover
 from .datasource import JQuantsSource, YFinanceSource
 from .model import MeanReversionRule
 from .notifier import ConsoleNotifier, DiscordNotifier, format_orders
@@ -98,6 +103,10 @@ def morning_pipeline(
         log.info("non-business day: %s", as_of)
         return pd.DataFrame()
 
+    # P0: yfinance 近似を sizing に使う処理を拒否（明示オプトイン以外）
+    guard_approximate_turnover(cfg, context="morning_pipeline")
+    enforce_short_policy_for_live(cfg)
+
     run_id = uuid.uuid4().hex[:12]
     storage: Storage | None = Storage(cfg["data"]["db_path"]) if not dry_run else None
     ds = make_datasource(cfg)
@@ -108,7 +117,7 @@ def morning_pipeline(
     # yfinance 近似の再警告（本番誤用防止）
     if cfg.get("data", {}).get("source") == "yfinance":
         log.warning(
-            "data.source=yfinance: turnover は近似。本番は jquants に切替推奨。"
+            "data.source=yfinance: turnover は近似。本番は jquants に切替必須。"
         )
     if not cfg.get("backtest", {}).get("impact_k_is_calibrated", False):
         log.info(
@@ -172,6 +181,15 @@ def morning_pipeline(
         if orders.empty:
             notifier.send("本日はシグナル生成不可", "サイズ算定・リスク制限後に0件")
             return pd.DataFrame()
+
+        # P0: 売り注文が残っているのに shortability が取込済みで無い場合に警告
+        n_sell = len(orders[orders["side"] == "SELL"]) if "side" in orders.columns else 0
+        if n_sell > 0 and shortability_df.empty:
+            log.error(
+                "shortability 未取込なのに売り注文 %d 件が残存。"
+                " risk.allow_short_without_confirmed_shortability を確認すること。",
+                n_sell,
+            )
 
         if not dry_run and storage is not None:
             orders["order_date"] = str(as_of)
