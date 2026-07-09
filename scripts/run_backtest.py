@@ -13,19 +13,18 @@ import pandas as pd
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from jp_signal.backtest import Backtester
-from jp_signal.calendar import previous_business_day
 from jp_signal.config import load_config
+from jp_signal.metrics import summarize_backtest
 from jp_signal.model import MeanReversionRule
-from jp_signal.risk import apply_order_risk_limits, risk_config_from_dict
-from jp_signal.sizing import compute_size
+from jp_signal.order_builder import signals_to_orders
+from jp_signal.risk import risk_config_from_dict
 from jp_signal.storage import Storage
 from jp_signal.universe import load_universe
 
 
 def main() -> None:
     cfg = load_config()
-    st = Storage(cfg["data"]["db_path"])
-    try:
+    with Storage(cfg["data"]["db_path"]) as st:
         univ_all = load_universe(cfg["universe"])
         codes = univ_all["code"].tolist()
 
@@ -39,13 +38,16 @@ def main() -> None:
             print("価格データが空です。先に main.py 等で DB へ取り込んでください。")
             return
 
-        model = MeanReversionRule(lookback=5, top_n=5)
+        model = MeanReversionRule(
+            lookback=int(cfg.get("model", {}).get("lookback", 5)),
+            top_n=int(cfg.get("model", {}).get("top_n", 5)),
+        )
         holding_days = int(cfg["backtest"].get("holding_days", 1))
+        risk_cfg = risk_config_from_dict(cfg.get("risk", {}))
         all_dates = sorted(prices["date"].unique())
 
         signal_frames: list[pd.DataFrame] = []
         for d in all_dates[20:]:
-            # point-in-time ユニバース（CSV に effective_from/to がある場合のみ有効）
             univ_d = load_universe(cfg["universe"], as_of=d)
             codes_d = set(univ_d["code"].tolist())
             px_d = prices[prices["code"].isin(codes_d)]
@@ -56,105 +58,69 @@ def main() -> None:
             if sig.empty:
                 continue
 
-            # 寄前想定: 当日終値は未確定 → 前営業日までのデータで参照価格を計算
-            as_of_ts = pd.Timestamp(d)
-            cutoff = previous_business_day(as_of_ts.date()).isoformat()
-            prev = px_d[px_d["date"] <= cutoff].sort_values("date")
-            last_row = prev.groupby("code").tail(1).set_index("code")
-
-            day_rows = []
-            for _, r in sig.iterrows():
-                code = r["code"]
-                if code not in last_row.index:
-                    continue
-                ref = float(last_row.loc[code, "close"])
-                adv_val = float(last_row.loc[code, "turnover"])
-                qty, yen, warn = compute_size(
-                    adv_val,
-                    ref,
-                    cfg["sizing"]["adv_ratio"],
-                    cfg["sizing"]["adv_ratio_cap"],
-                    unit=100,
-                    market_open_unit_cap=cfg["sizing"]["market_open_unit_cap"],
-                    is_market_open_order=True,
-                )
-                if qty == 0:
-                    continue
-                day_rows.append(
-                    {
-                        "code": code,
-                        "date": d,
-                        "side": r["side"],
-                        "qty": qty,
-                        "order_type": "MKT_OPEN",
-                        "limit_price": None,
-                        "holding_days": holding_days,
-                        "value_yen": yen,
-                        "score": float(r.get("score", 0)),
-                        # BTでも shortability 未確認は不可扱い
-                        "shortable": False if short.empty else None,
-                    }
-                )
-
-            if not day_rows:
-                continue
-
-            day_df = pd.DataFrame(day_rows)
-
-            # shortability 付与
-            if not short.empty:
-                sh = short.copy()
-                sh["date"] = pd.to_datetime(sh["date"])
-                asof_ts = pd.Timestamp(d)
-
-                def _is_ok(code: str, _sh=sh, _asof=asof_ts) -> bool:
-                    g = _sh[(_sh["code"] == code) & (_sh["date"] <= _asof)]
-                    if g.empty:
-                        return False
-                    latest = g.sort_values("date").iloc[-1]
-                    return (
-                        int(latest["is_margin_lendable"]) == 1
-                        and int(latest["short_restricted"]) == 0
-                    )
-
-                day_df["shortable"] = day_df["code"].apply(_is_ok)
-
-            # リスク制限を適用（live pipeline と同じロジック）
-            risk_cfg = risk_config_from_dict(cfg.get("risk", {}))
-            day_df = apply_order_risk_limits(day_df, risk_cfg, score_col="score")
-
-            if not day_df.empty:
-                signal_frames.append(day_df)
+            day_orders = signals_to_orders(
+                sig,
+                px_d,
+                as_of=d,
+                sizing_cfg=cfg["sizing"],
+                risk_cfg=risk_cfg,
+                shortability=short if not short.empty else None,
+                universe=univ_d,
+                holding_days=holding_days,
+                order_type="MKT_OPEN",
+                unit=int(cfg.get("sizing", {}).get("unit", 100)),
+                for_backtest=True,
+            )
+            if not day_orders.empty:
+                signal_frames.append(day_orders)
 
         if not signal_frames:
             print("シグナル0件。バックテストをスキップします。")
             return
 
         signals = pd.concat(signal_frames, ignore_index=True)
+        # Backtester 必須列の保証
+        if "limit_price" not in signals.columns:
+            signals["limit_price"] = None
+
         bt = Backtester(
             impact_k_bp=float(cfg["backtest"].get("impact_k_bp", 30.0)),
             annual_interest_rate=float(cfg["backtest"].get("annual_interest_rate", 0.02)),
             annual_lending_rate=float(cfg["backtest"].get("short_lending_rate", 0.02)),
+            commission_bp=float(cfg["backtest"].get("commission_bp", 0.0)),
+            half_spread_bp=float(cfg["backtest"].get("half_spread_bp", 0.0)),
             adv_window=int(cfg["backtest"].get("adv_window", 20)),
             require_liquidity_data=True,
+            zero_carry_for_intraday=True,
         )
-        result = bt.run(signals, prices, shortability=short if not short.empty else None)
+        result = bt.run(
+            signals,
+            prices,
+            shortability=short if not short.empty else None,
+        )
         if result.empty:
             print("バックテスト結果が空です。")
             return
 
-        filled = result[result["status"] == "FILLED"].copy()
-        print(f"全シグナル: {len(result)}")
-        print(f"約定: {len(filled)}")
-        print(f"約定率: {(len(filled) / max(len(result), 1)) * 100:.1f}%")
-        if not filled.empty:
-            print(f"合計PnL: {filled['pnl'].sum():.0f}")
-            print(f"勝率: {(filled['pnl'] > 0).mean() * 100:.1f}%")
-            daily = filled.groupby("date")["pnl"].sum()
-            print(f"日次PnL平均  : {daily.mean():.0f}")
-            print(f"日次PnL標準偏差: {daily.std():.0f}")
-    finally:
-        st.close()
+        summary = summarize_backtest(result)
+        print(f"全シグナル: {summary['n_signals']}")
+        print(f"約定: {summary['n_filled']}")
+        print(f"約定率: {summary['fill_rate'] * 100:.1f}%")
+        print(f"合計PnL: {summary['total_pnl']:.0f}")
+        print(f"勝率: {summary['win_rate'] * 100:.1f}%")
+        print(f"日次PnL平均  : {summary['daily_pnl_mean']:.0f}")
+        print(f"日次PnL標準偏差: {summary['daily_pnl_std']:.0f}")
+        print(f"Sharpe-like: {summary['sharpe_like']:.2f}")
+        print(f"MaxDD(PnL): {summary['max_drawdown_pnl']:.0f}")
+        print(f"status: {summary['status_counts']}")
+
+        # 成果物
+        out_dir = cfg.get("backtest", {}).get("output_dir", "./data/bt_out")
+        os.makedirs(out_dir, exist_ok=True)
+        result.to_csv(os.path.join(out_dir, "trades.csv"), index=False)
+        if "daily_pnl" in summary and summary["daily_pnl"] is not None:
+            summary["daily_pnl"].to_csv(os.path.join(out_dir, "daily_pnl.csv"), header=["pnl"])
+        print(f"wrote: {out_dir}/trades.csv")
 
 
 if __name__ == "__main__":

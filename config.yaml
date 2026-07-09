@@ -1,11 +1,14 @@
 data:
   source: "yfinance"          # "yfinance" | "jquants"
   db_path: "./data/jp_signal.sqlite"
-  jquants_api_key: ""        # 使わず環境変数 JQUANTS_API_KEY 推奨（V2）
-  jquants_refresh_token: ""   # V1 後方互換（JQUANTS_REFRESH_TOKEN）
+  # 秘密情報は環境変数 JQUANTS_API_KEY / DISCORD_WEBHOOK で設定推奨
 
 universe:
   file: "./data/topix500.csv" # 推奨: code,name,effective_from,effective_to
+
+model:
+  lookback: 5
+  top_n: 5
 
 backtest:
   start: "2022-01-01"
@@ -15,11 +18,15 @@ backtest:
   short_lending_rate: 0.02
   adv_window: 20
   holding_days: 1
+  commission_bp: 0.0
+  half_spread_bp: 0.0
+  output_dir: "./data/bt_out"
 
 sizing:
   adv_ratio: 0.001
   adv_ratio_cap: 0.002
   market_open_unit_cap: 50
+  unit: 100
 
 risk:
   max_orders_per_day: 10
@@ -31,6 +38,6 @@ risk:
 
 notify:
   channel: "console"          # "console" | "discord"
-  discord_webhook: ""         # または環境変数 DISCORD_WEBHOOK
+  # discord_webhook: 環境変数 DISCORD_WEBHOOK で設定
   morning_time: "08:15"
   closing_time: "15:00"

@@ -385,3 +385,22 @@ class Storage:
 
     def close(self) -> None:
         self.conn.close()
+
+    def __enter__(self) -> Storage:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def max_price_date(self, codes: list[str] | None = None) -> str | None:
+        """prices テーブルの最大 date を返す。無ければ None。"""
+        if codes:
+            codes = [str(c) for c in codes]
+            placeholders = ",".join("?" * len(codes))
+            q = f"SELECT MAX(date) FROM prices WHERE code IN ({placeholders})"
+            row = self.conn.execute(q, codes).fetchone()
+        else:
+            row = self.conn.execute("SELECT MAX(date) FROM prices").fetchone()
+        if row is None or row[0] is None:
+            return None
+        return str(row[0])
