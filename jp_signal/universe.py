@@ -37,19 +37,27 @@ def normalize_code(code: str) -> str:
 
 
 def load_universe(
-    path: str,
+    path_or_cfg: str | dict,
     as_of: str | None = None,
 ) -> pd.DataFrame:
     """CSV からユニバースを読み込む。
 
     Args:
-        path: CSV ファイル (code, name[, effective_from, effective_to])。
+        path_or_cfg: CSV パス、または config の universe セクション dict
+                     （key: file）。
         as_of: 指定日時点の有効な銘柄のみにフィルタ。
                未指定なら全件（effective_from/effective_to が無い古いCSVも読める）。
 
     Returns:
         code, name の DataFrame。code は正規化・ソート済み。
     """
+    if isinstance(path_or_cfg, dict):
+        path = path_or_cfg.get("file")
+        if not path:
+            raise ValueError("universe.file が設定されていません")
+    else:
+        path = path_or_cfg
+
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(

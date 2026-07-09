@@ -13,8 +13,10 @@ import pandas as pd
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from jp_signal.backtest import Backtester
+from jp_signal.calendar import previous_business_day
 from jp_signal.config import load_config
 from jp_signal.model import MeanReversionRule
+from jp_signal.risk import apply_order_risk_limits, risk_config_from_dict
 from jp_signal.sizing import compute_size
 from jp_signal.storage import Storage
 from jp_signal.universe import load_universe
@@ -54,16 +56,20 @@ def main() -> None:
             if sig.empty:
                 continue
 
-            prev = px_d[px_d["date"] < d].sort_values("date")
+            # 寄前想定: 当日終値は未確定 → 前営業日までのデータで参照価格を計算
+            as_of_ts = pd.Timestamp(d)
+            cutoff = previous_business_day(as_of_ts.date()).isoformat()
+            prev = px_d[px_d["date"] <= cutoff].sort_values("date")
             last_row = prev.groupby("code").tail(1).set_index("code")
 
+            day_rows = []
             for _, r in sig.iterrows():
                 code = r["code"]
                 if code not in last_row.index:
                     continue
                 ref = float(last_row.loc[code, "close"])
                 adv_val = float(last_row.loc[code, "turnover"])
-                qty, _, _ = compute_size(
+                qty, yen, warn = compute_size(
                     adv_val,
                     ref,
                     cfg["sizing"]["adv_ratio"],
@@ -74,7 +80,7 @@ def main() -> None:
                 )
                 if qty == 0:
                     continue
-                signal_frames.append(
+                day_rows.append(
                     {
                         "code": code,
                         "date": d,
@@ -83,14 +89,48 @@ def main() -> None:
                         "order_type": "MKT_OPEN",
                         "limit_price": None,
                         "holding_days": holding_days,
+                        "value_yen": yen,
+                        "score": float(r.get("score", 0)),
+                        # BTでも shortability 未確認は不可扱い
+                        "shortable": False if short.empty else None,
                     }
                 )
+
+            if not day_rows:
+                continue
+
+            day_df = pd.DataFrame(day_rows)
+
+            # shortability 付与
+            if not short.empty:
+                sh = short.copy()
+                sh["date"] = pd.to_datetime(sh["date"])
+                asof_ts = pd.Timestamp(d)
+
+                def _is_ok(code: str, _sh=sh, _asof=asof_ts) -> bool:
+                    g = _sh[(_sh["code"] == code) & (_sh["date"] <= _asof)]
+                    if g.empty:
+                        return False
+                    latest = g.sort_values("date").iloc[-1]
+                    return (
+                        int(latest["is_margin_lendable"]) == 1
+                        and int(latest["short_restricted"]) == 0
+                    )
+
+                day_df["shortable"] = day_df["code"].apply(_is_ok)
+
+            # リスク制限を適用（live pipeline と同じロジック）
+            risk_cfg = risk_config_from_dict(cfg.get("risk", {}))
+            day_df = apply_order_risk_limits(day_df, risk_cfg, score_col="score")
+
+            if not day_df.empty:
+                signal_frames.append(day_df)
 
         if not signal_frames:
             print("シグナル0件。バックテストをスキップします。")
             return
 
-        signals = pd.DataFrame(signal_frames)
+        signals = pd.concat(signal_frames, ignore_index=True)
         bt = Backtester(
             impact_k_bp=float(cfg["backtest"].get("impact_k_bp", 30.0)),
             annual_interest_rate=float(cfg["backtest"].get("annual_interest_rate", 0.02)),

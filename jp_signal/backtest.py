@@ -1,4 +1,4 @@
-"""バックテストエンジン（FR-BT-01〜05）。
+"""バックテストエンジン（FR-BT-01〜06）。
 
 約定・コストモデル:
   - FR-BT-01: 買い指値 P は当日安値 < P で約定。
@@ -7,6 +7,7 @@
   - FR-BT-04: impact_bp = k * sqrt(order_value / adv)
               adv は直近 adv_window 日の平均売買代金
   - FR-BT-05: 売りは shortability 確認済みのみ
+  - FR-BT-06: 金利/貸株コストは実経過暦日数（calendar days）で按分
 """
 
 from __future__ import annotations
@@ -38,8 +39,10 @@ class Backtester:
         adv_window: int = 20,
     ):
         self.k = float(impact_k_bp)
-        self.daily_int = float(annual_interest_rate) / 365.0
-        self.daily_lend = float(annual_lending_rate) / 365.0
+        self.annual_int = float(annual_interest_rate)
+        self.annual_lend = float(annual_lending_rate)
+        self.daily_int = self.annual_int / 365.0
+        self.daily_lend = self.annual_lend / 365.0
         self.commission_bp = float(commission_bp)
         self.half_spread_bp = float(half_spread_bp)
         self.require_liquidity_data = bool(require_liquidity_data)
@@ -231,8 +234,11 @@ class Backtester:
                 exit_base, exit_base * qty, exit_adv, direction=-side_sign
             )
 
+            # FR-BT-06: 実経過暦日数で按分
+            cal_days = (exit_date - d).days
+            cal_days = max(cal_days, 1)
             carry_rate = self.daily_lend if s["side"] == "SELL" else self.daily_int
-            carry_cost = entry * carry_rate * holding_days
+            carry_cost = entry * carry_rate * cal_days
 
             direction = side_sign
             gross = (exit_price - entry) * direction * qty

@@ -147,7 +147,12 @@ def morning_pipeline(
             if qty == 0:
                 continue
 
-            shortable = _latest_shortable(shortability_df, code, as_of) if not shortability_df.empty else True
+            # 未取得・不明は売り不可（保守側）。FR-BT-05 と整合。
+            shortable = (
+                _latest_shortable(shortability_df, code, as_of)
+                if not shortability_df.empty
+                else False
+            )
             name = univ_idx.loc[code, "name"] if code in univ_idx.index else ""
             rows.append(
                 {

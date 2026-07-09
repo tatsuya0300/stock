@@ -15,13 +15,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 import pandas as pd
 
-
-def _previous_business_day(d) -> pd.Timestamp:
-    """d より前の直近営業日（簡易実装: 土日をスキップ）。"""
-    ts = pd.Timestamp(d)
-    while ts.weekday() >= 5:  # 土日
-        ts -= pd.Timedelta(days=1)
-    return ts
+from .calendar import previous_business_day
 
 
 class SignalModel(ABC):
@@ -51,7 +45,9 @@ class MeanReversionRule(SignalModel):
 
         as_of_d = pd.Timestamp(as_of).date()
         # 寄前想定: 当日終値は未確定のため使わない
-        cutoff = _previous_business_day(as_of_d).isoformat()
+        # 祝日・年末年始も calendar.previous_business_day で除外
+        cutoff_d = previous_business_day(as_of_d)
+        cutoff = cutoff_d.isoformat()
 
         df = prices[prices["date"] <= cutoff].copy()
         if df.empty:

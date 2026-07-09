@@ -7,6 +7,38 @@ import pandas as pd
 from jp_signal.pipeline import _latest_shortable
 
 
+def test_latest_shortable_empty_df_is_false():
+    assert _latest_shortable(pd.DataFrame(), "7203", date(2024, 1, 5)) is False
+
+
+def test_latest_shortable_unknown_code_is_false():
+    df = pd.DataFrame(
+        [
+            {
+                "code": "7203",
+                "date": "2024-01-04",
+                "is_margin_lendable": 1,
+                "short_restricted": 0,
+            }
+        ]
+    )
+    assert _latest_shortable(df, "9999", date(2024, 1, 5)) is False
+
+
+def test_latest_shortable_confirmed_true():
+    df = pd.DataFrame(
+        [
+            {
+                "code": "7203",
+                "date": "2024-01-04",
+                "is_margin_lendable": 1,
+                "short_restricted": 0,
+            }
+        ]
+    )
+    assert _latest_shortable(df, "7203", date(2024, 1, 5)) is True
+
+
 def test_latest_shortable_true():
     df = pd.DataFrame(
         [
