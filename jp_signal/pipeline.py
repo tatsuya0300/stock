@@ -20,6 +20,38 @@ from .storage import Storage
 from .universe import load_universe
 
 
+def _latest_shortable(
+    shortability: pd.DataFrame, code: str, as_of: date
+) -> bool:
+    """指定コード・日付時点の最短過去の売り可否を返す。
+
+    Args:
+        shortability: code, date, is_margin_lendable, short_restricted の DataFrame。
+        code: 銘柄コード。
+        as_of: 基準日。この日付以前の最新スナップショットを使用。
+
+    Returns:
+        売り可能なら True、データ不足や制限ありなら False。
+    """
+    if shortability is None or shortability.empty:
+        return False
+
+    sub = shortability[shortability["code"] == code].copy()
+    if sub.empty:
+        return False
+
+    sub["date"] = pd.to_datetime(sub["date"])
+    past = sub[sub["date"] <= pd.Timestamp(as_of)]
+    if past.empty:
+        return False
+
+    latest = past.sort_values("date").iloc[-1]
+    return (
+        int(latest["is_margin_lendable"]) == 1
+        and int(latest["short_restricted"]) == 0
+    )
+
+
 def make_datasource(cfg: dict):
     if cfg["data"]["source"] == "jquants":
         return JQuantsSource(cfg["data"]["jquants_refresh_token"])

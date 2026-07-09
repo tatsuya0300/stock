@@ -55,6 +55,15 @@ Adds regression tests for:
 - Risk limits
 - Price data quality checks
 
+Additional datasource tests:
+
+- yfinance raw/adjusted schema normalization
+- Fallback behavior when Adj Close is missing
+- J-Quants response schema validation
+- Datasource fetch wrapper behavior
+- Model uses adj_close for returns
+- Shortability helper ignores future snapshots
+
 Behavioral Changes
 
 Backtest results may worsen because several optimistic assumptions were removed:
