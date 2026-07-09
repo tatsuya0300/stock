@@ -8,7 +8,7 @@ import pytest
 from jp_signal.datasource import (
     JQuantsSource,
     YFinanceSource,
-    _standardize_jquants_frame,
+    _standardize_jquants_v2_frame,
     _standardize_yfinance_frame,
 )
 
@@ -91,7 +91,7 @@ def test_standardize_yfinance_missing_raw_column_raises():
         _standardize_yfinance_frame(raw, "7203")
 
 
-def test_standardize_jquants_frame():
+def test_standardize_jquants_v2_frame():
     raw = pd.DataFrame(
         [
             {
@@ -111,7 +111,7 @@ def test_standardize_jquants_frame():
         ]
     )
 
-    out = _standardize_jquants_frame(raw)
+    out = _standardize_jquants_v2_frame(raw)
 
     assert out.iloc[0]["code"] == "7203"
     assert out.iloc[0]["open"] == 100.0
@@ -119,7 +119,7 @@ def test_standardize_jquants_frame():
     assert out.iloc[0]["turnover"] == 104000.0
 
 
-def test_standardize_jquants_missing_column_raises():
+def test_standardize_jquants_v2_missing_column_raises():
     raw = pd.DataFrame(
         [
             {
@@ -140,7 +140,7 @@ def test_standardize_jquants_missing_column_raises():
     )
 
     with pytest.raises(KeyError):
-        _standardize_jquants_frame(raw)
+        _standardize_jquants_v2_frame(raw)
 
 
 def test_yfinance_source_fetch_daily(monkeypatch):
@@ -161,8 +161,8 @@ def test_yfinance_source_fetch_daily(monkeypatch):
     fake.index.name = "Date"
 
     def fake_download(*args, **kwargs):
-        assert kwargs["auto_adjust"] is False
-        assert kwargs["repair"] is True
+        assert kwargs.get("auto_adjust") is False
+        assert kwargs.get("repair") is True
         return fake
 
     monkeypatch.setattr(yf, "download", fake_download)
@@ -175,6 +175,6 @@ def test_yfinance_source_fetch_daily(monkeypatch):
     assert out.iloc[0]["date"] == "2024-01-04"
 
 
-def test_jquants_source_requires_refresh_token():
+def test_jquants_source_requires_api_key():
     with pytest.raises(ValueError):
         JQuantsSource("")

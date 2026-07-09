@@ -1,7 +1,8 @@
 data:
   source: "yfinance"          # "yfinance" | "jquants"
   db_path: "./data/jp_signal.sqlite"
-  jquants_refresh_token: ""   # 使わず環境変数 JQUANTS_REFRESH_TOKEN 推奨
+  jquants_api_key: ""        # 使わず環境変数 JQUANTS_API_KEY 推奨（V2）
+  jquants_refresh_token: ""   # V1 後方互換（JQUANTS_REFRESH_TOKEN）
 
 universe:
   file: "./data/topix500.csv" # 推奨: code,name,effective_from,effective_to

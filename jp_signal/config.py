@@ -2,7 +2,8 @@
 
 config.yaml の読み込みとバリデーションを行う。
 秘密情報は環境変数で上書き可能:
-  - JQUANTS_REFRESH_TOKEN
+  - JQUANTS_API_KEY（V2。推奨）
+  - JQUANTS_REFRESH_TOKEN（V1。後方互換）
   - DISCORD_WEBHOOK
 """
 
@@ -32,7 +33,7 @@ _DEFAULT_RISK = {
 def load_config(path: str = "config.yaml") -> dict:
     """config.yaml を読み込みバリデーションする。
 
-    環境変数 JQUANTS_REFRESH_TOKEN / DISCORD_WEBHOOK で
+    環境変数 JQUANTS_API_KEY または JQUANTS_REFRESH_TOKEN / DISCORD_WEBHOOK で
     config.yaml の値を上書きできる。
     """
     if yaml is None:
@@ -53,6 +54,12 @@ def load_config(path: str = "config.yaml") -> dict:
         raise ValueError(f"設定ファイルに必須キーが不足: {sorted(missing)}")
 
     # 環境変数で秘密情報を上書き
+    # J-Quants V2: API Key
+    env_api_key = os.getenv("JQUANTS_API_KEY")
+    if env_api_key:
+        cfg.setdefault("data", {})["jquants_api_key"] = env_api_key
+
+    # J-Quants V1: Refresh Token（後方互換）
     env_token = os.getenv("JQUANTS_REFRESH_TOKEN")
     if env_token:
         cfg.setdefault("data", {})["jquants_refresh_token"] = env_token
@@ -70,11 +77,13 @@ def load_config(path: str = "config.yaml") -> dict:
             f"(actual: {source!r})"
         )
 
-    if source == "jquants" and not cfg.get("data", {}).get("jquants_refresh_token"):
-        raise ValueError(
-            "data.source=jquants の場合は環境変数 JQUANTS_REFRESH_TOKEN か "
-            "data.jquants_refresh_token が必要です"
-        )
+    if source == "jquants":
+        api_key = cfg.get("data", {}).get("jquants_api_key", "")
+        if not api_key:
+            raise ValueError(
+                "data.source=jquants の場合は環境変数 JQUANTS_API_KEY "
+                "(V2 API Key) を設定してください。"
+            )
 
     # sizing のバリデーション
     sizing = cfg.get("sizing", {})

@@ -34,9 +34,9 @@ Live pipeline safety
 
 Configuration
 
-- Environment variable override for JQUANTS_REFRESH_TOKEN and DISCORD_WEBHOOK.
+- Environment variable override for JQUANTS_API_KEY (V2,推奨), JQUANTS_REFRESH_TOKEN (V1互換), and DISCORD_WEBHOOK.
 - Validates adv_ratio > 0, adv_ratio <= adv_ratio_cap.
-- Validates J-Quants token required when source=jquants.
+- Validates J-Quants API key required when source=jquants.
 - Risk section with defaults.
 - backtest section with adv_window, holding_days, etc.
 
@@ -72,6 +72,8 @@ Adds regression tests for:
 Scripts
 
 - scripts/run_backtest.py: end-to-end backtest script using DB + config.
+- scripts/build_universe_from_jpx_weights.py: JPX公開ウェイトファイルからユニバースCSV生成。
+- scripts/build_pit_universe_from_events.py: ADD/REMOVEイベント履歴からPITユニバース構築。
 
 Behavioral Changes
 
@@ -92,7 +94,10 @@ This PR does not fully solve data availability issues that require external data
 - Historical point-in-time TOPIX500 membership must be supplied as data.
 - JSF shortability ingestion still depends on official/public format confirmation.
 - Reverse stock lending fee / gyaku-hibu requires additional data.
-- J-Quants column mapping should be verified against current official API documentation before production use.
+- TOPIX500 厳密な日次PITは未解決（イベント積み上げ or 有料マスタが必要）。
+- --top 500 による近似は公式TOPIX500選定ロジックと一致しない。
+- shortability 本実装は未着手。
+- J-Quants レート制限（Free=5req/min）は sleep 緩和のみ。
 - Existing SQLite DBs with PRIMARY KEY-less signals/orders tables should be deleted and recreated.
 
 Test Plan

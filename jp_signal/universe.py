@@ -71,17 +71,15 @@ def load_universe(
             f"重複コード検出: {dupes['code'].unique().tolist()}"
         )
 
-    # point-in-time フィルタリング
+    # point-in-time フィルタリング（日付比較を厳密化）
     if as_of is not None:
         as_of_ts = pd.Timestamp(as_of)
         if "effective_from" in df.columns:
-            df = df[
-                (df["effective_from"].fillna("1900-01-01").apply(pd.Timestamp) <= as_of_ts)
-            ]
+            ef = pd.to_datetime(df["effective_from"].fillna("1900-01-01"))
+            df = df[ef <= as_of_ts]
         if "effective_to" in df.columns:
-            df = df[
-                (df["effective_to"].fillna("2099-12-31").apply(pd.Timestamp) >= as_of_ts)
-            ]
+            et = pd.to_datetime(df["effective_to"].fillna("2099-12-31"))
+            df = df[et >= as_of_ts]
 
     df = df.sort_values("code").reset_index(drop=True)
     return df[["code", "name"]]

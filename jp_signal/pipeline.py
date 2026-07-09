@@ -50,7 +50,7 @@ def _latest_shortable(
 
 def make_datasource(cfg: dict):
     if cfg["data"]["source"] == "jquants":
-        return JQuantsSource(cfg["data"]["jquants_refresh_token"])
+        return JQuantsSource(cfg["data"]["jquants_api_key"])
     return YFinanceSource()
 
 

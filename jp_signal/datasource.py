@@ -1,13 +1,15 @@
 """価格データソース。
 
 設計原則:
-- 約定・売買金額には raw open/high/low/close を使う。
-- 特徴量・リターンには adjusted open/high/low/close を使う。
-- datasource 層で raw と adjusted を分離した統一スキーマに変換する。
+- 約定・売買金額には raw OHLC を使う。
+- 特徴量・リターンには adjusted OHLC を使う。
+- datasource 層で raw / adjusted を分離した統一スキーマに変換する。
 
 注意:
 - yfinance の end は exclusive。
-- J-Quants の列名・pagination key 名・エンドポイントは公式仕様で確認が必要。
+- J-Quants は V2 API（API Key 認証）を使用する。
+  公式: https://jpx-jquants.com/en/spec/migration-v1-v2
+        https://jpx-jquants.com/en/spec/eq-bars-daily
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from abc import ABC, abstractmethod
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
@@ -35,18 +37,16 @@ class PriceDataSource(ABC):
     def fetch_daily(self, codes: list[str], start: date, end: date) -> pd.DataFrame:
         """日足価格を統一スキーマで返す。
 
-        returns:
-            columns:
-            code, date,
-            open, high, low, close,
-            adj_open, adj_high, adj_low, adj_close,
-            volume, turnover
+        returns columns:
+          code, date,
+          open, high, low, close,
+          adj_open, adj_high, adj_low, adj_close,
+          volume, turnover
         """
         raise NotImplementedError
 
 
 def _requests_session_with_retry():
-    """指数バックオフ付き requests.Session を返す。"""
     import requests
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
@@ -57,6 +57,7 @@ def _requests_session_with_retry():
         backoff_factor=1.0,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset({"GET", "POST"}),
+        raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
@@ -69,7 +70,6 @@ def _empty_prices() -> pd.DataFrame:
 
 
 def _flatten_yfinance_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """yfinance が MultiIndex 列を返す場合に平坦化する。"""
     if isinstance(df.columns, pd.MultiIndex):
         out = df.copy()
         out.columns = out.columns.get_level_values(0)
@@ -78,17 +78,15 @@ def _flatten_yfinance_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _standardize_yfinance_frame(df: pd.DataFrame, code: str) -> pd.DataFrame:
-    """yfinance の戻り値を統一スキーマへ変換する。
+    """yfinance 戻り値を統一スキーマへ。
 
-    yfinance は raw OHLC と Adj Close は返すが、adjusted OHLC は直接返さない。
-    そのため adj_open/high/low は adj_close / close の比率で近似する。
-    ただし、約定には raw OHLC を使うので、この近似値は特徴量用途に限定する。
+    yfinance は raw OHLC + Adj Close を返す。
+    adj_open/high/low は adj_close/close 比率で近似（特徴量用途限定）。
     """
     if df is None or df.empty:
         return _empty_prices()
 
     x = _flatten_yfinance_columns(df).copy()
-
     x = x.reset_index().rename(
         columns={
             "Date": "date",
@@ -111,7 +109,6 @@ def _standardize_yfinance_frame(df: pd.DataFrame, code: str) -> pd.DataFrame:
         log.warning("%s: Adj Close missing; fallback adj_close=close", code)
         x["adj_close"] = x["close"]
 
-    # close が0または欠損の場合の調整比率は 1.0 にフォールバック。
     close = pd.to_numeric(x["close"], errors="coerce")
     adj_close = pd.to_numeric(x["adj_close"], errors="coerce")
     ratio = adj_close / close
@@ -120,37 +117,66 @@ def _standardize_yfinance_frame(df: pd.DataFrame, code: str) -> pd.DataFrame:
     x["adj_open"] = pd.to_numeric(x["open"], errors="coerce") * ratio
     x["adj_high"] = pd.to_numeric(x["high"], errors="coerce") * ratio
     x["adj_low"] = pd.to_numeric(x["low"], errors="coerce") * ratio
-
     x["code"] = normalize_code(code)
-    x["turnover"] = pd.to_numeric(x["close"], errors="coerce") * pd.to_numeric(
-        x["volume"], errors="coerce"
-    )
+    x["turnover"] = close * pd.to_numeric(x["volume"], errors="coerce")
     x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
 
     return x[OUTPUT_COLS]
 
 
-def _standardize_jquants_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """J-Quants の daily_quotes 応答を統一スキーマへ変換する。
+def _to_jquants_code(code: str) -> str:
+    """内部4桁コードを J-Quants の発行体コードへ。
 
-    注意:
-    以下の列名は J-Quants API の仕様に依存する。
-    本番運用前に公式仕様で必ず確認すること。
+    公式は 4桁（普通株）または 5桁（例: 86970）を受け付ける。
+    4桁指定時は普通株のみ取得される。
+    参考: https://jpx-jquants.com/en/spec/eq-bars-daily
+    """
+    c = normalize_code(code)
+    if c.isdigit() and len(c) == 4:
+        return c
+    return c
+
+
+def _from_jquants_code(code: str) -> str:
+    """J-Quants の Code を内部4桁へ正規化。
+
+    例: '86970' -> '8697', '7203' -> '7203'
+    """
+    c = str(code).strip()
+    if c.isdigit() and len(c) == 5 and c.endswith("0"):
+        return c[:4]
+    return normalize_code(c)
+
+
+def _standardize_jquants_v2_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """J-Quants V2 /v2/equities/bars/daily を統一スキーマへ。
+
+    V2 列名:
+      Date, Code, O, H, L, C, Vo, Va, AdjO, AdjH, AdjL, AdjC, ...
     """
     if df is None or df.empty:
         return _empty_prices()
 
     x = df.copy()
-
     rename_map = {
         "Date": "date",
         "Code": "code",
-        # raw OHLC: 約定・売買金額用
+        # V2 短縮形
+        "O": "open",
+        "H": "high",
+        "L": "low",
+        "C": "close",
+        "AdjO": "adj_open",
+        "AdjH": "adj_high",
+        "AdjL": "adj_low",
+        "AdjC": "adj_close",
+        "Vo": "volume",
+        "Va": "turnover",
+        # V1 形式（互換）
         "Open": "open",
         "High": "high",
         "Low": "low",
         "Close": "close",
-        # adjusted OHLC: 特徴量・リターン用
         "AdjustmentOpen": "adj_open",
         "AdjustmentHigh": "adj_high",
         "AdjustmentLow": "adj_low",
@@ -158,18 +184,25 @@ def _standardize_jquants_frame(df: pd.DataFrame) -> pd.DataFrame:
         "Volume": "volume",
         "TurnoverValue": "turnover",
     }
-
     x = x.rename(columns=rename_map)
 
     missing = [col for col in OUTPUT_COLS if col not in x.columns]
     if missing:
         raise KeyError(
             f"J-Quants response missing columns: {missing}. "
-            "J-Quants公式仕様で列名を確認してください。"
+            "公式仕様を確認してください: "
+            "https://jpx-jquants.com/en/spec/eq-bars-daily"
         )
 
-    x["code"] = x["code"].astype(str).map(normalize_code)
+    x["code"] = x["code"].astype(str).map(_from_jquants_code)
     x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
+
+    for c in [
+        "open", "high", "low", "close",
+        "adj_open", "adj_high", "adj_low", "adj_close",
+        "volume", "turnover",
+    ]:
+        x[c] = pd.to_numeric(x[c], errors="coerce")
 
     return x[OUTPUT_COLS]
 
@@ -178,152 +211,219 @@ class YFinanceSource(PriceDataSource):
     """プロトタイプ用 yfinance datasource。
 
     yfinance.download の end は exclusive。
-    例:
-        start=2024-01-01, end=2024-01-06
-        -> 2024-01-05 まで取得される。
+    本クラス内で end を +1 day して inclusive にする。
     """
 
-    def __init__(self, *, strict_data_quality: bool = False):
+    def __init__(self, *, strict_data_quality: bool = False, chunk_size: int = 50):
         self.strict_data_quality = strict_data_quality
+        self.chunk_size = max(1, int(chunk_size))
 
     def fetch_daily(self, codes: list[str], start: date, end: date) -> pd.DataFrame:
         import yfinance as yf
 
+        if not codes:
+            return _empty_prices()
+
+        # end exclusive 対策
+        end_exclusive = end + timedelta(days=1)
+
+        norm_codes = [normalize_code(c) for c in codes]
+        symbols = [f"{c}.T" for c in norm_codes]
+        code_map = {f"{c}.T": c for c in norm_codes}
+
         frames: list[pd.DataFrame] = []
+        failed: list[str] = []
 
-        for raw_code in codes:
-            c = normalize_code(raw_code)
-            sym = f"{c}.T"
-
+        for i in range(0, len(symbols), self.chunk_size):
+            chunk = symbols[i : i + self.chunk_size]
             try:
-                df = yf.download(
-                    sym,
-                    start=start,
-                    end=end,
+                raw = yf.download(
+                    tickers=chunk,
+                    start=start.isoformat(),
+                    end=end_exclusive.isoformat(),
                     auto_adjust=False,
                     repair=True,
+                    group_by="ticker",
+                    threads=True,
                     progress=False,
-                    threads=False,
-                    timeout=30,
+                    timeout=60,
                 )
-                std = _standardize_yfinance_frame(df, c)
-                if not std.empty:
-                    frames.append(std)
-
             except Exception as exc:
-                log.warning("yfinance fetch failed: symbol=%s error=%s", sym, exc)
+                log.warning("yfinance chunk failed: n=%d error=%s", len(chunk), exc)
+                failed.extend(chunk)
                 continue
+
+            if raw is None or raw.empty:
+                failed.extend(chunk)
+                continue
+
+            # 単一銘柄は MultiIndex にならないことがある
+            if len(chunk) == 1:
+                sym = chunk[0]
+                try:
+                    std = _standardize_yfinance_frame(raw, code_map[sym])
+                    if std.empty:
+                        failed.append(sym)
+                    else:
+                        frames.append(std)
+                except Exception as exc:
+                    log.warning("yfinance standardize failed: %s error=%s", sym, exc)
+                    failed.append(sym)
+                continue
+
+            # 複数銘柄
+            if isinstance(raw.columns, pd.MultiIndex):
+                level0 = set(raw.columns.get_level_values(0))
+            else:
+                log.warning("unexpected yfinance columns format for chunk size=%d", len(chunk))
+                failed.extend(chunk)
+                continue
+
+            for sym in chunk:
+                if sym not in level0:
+                    failed.append(sym)
+                    continue
+                try:
+                    part = raw[sym].dropna(how="all")
+                    std = _standardize_yfinance_frame(part, code_map[sym])
+                    if std.empty:
+                        failed.append(sym)
+                    else:
+                        frames.append(std)
+                except Exception as exc:
+                    log.warning("yfinance standardize failed: %s error=%s", sym, exc)
+                    failed.append(sym)
+
+        if failed:
+            log.warning(
+                "yfinance failed/empty for %d symbols (show 10): %s",
+                len(failed),
+                failed[:10],
+            )
 
         if not frames:
             return _empty_prices()
 
         out = pd.concat(frames, ignore_index=True)
+        # inclusive end を保証
+        out = out[out["date"] <= end.isoformat()]
         return validate_prices(out, strict=self.strict_data_quality)
 
 
 class JQuantsSource(PriceDataSource):
-    """J-Quants datasource。
+    """J-Quants V2 datasource。
 
-    注意:
-    - endpoint
-    - response key
-    - pagination key
-    - idToken TTL
-    - column names
+    V2 認証: API Key (x-api-key header)。
+    株価 endpoint: /v2/equities/bars/daily。
+    応答キー: data（旧 daily_quotes ではない）。
 
-    これらは J-Quants 公式仕様に依存する。
-    本番運用前に必ず確認すること。
+    参考:
+      https://jpx-jquants.com/en/spec/migration-v1-v2
+      https://jpx-jquants.com/en/spec/eq-bars-daily
     """
 
-    BASE = "https://api.jquants.com/v1"
-    _ID_TOKEN_TTL = timedelta(hours=20)
+    BASE = "https://api.jquants.com/v2"
 
-    def __init__(self, refresh_token: str, *, strict_data_quality: bool = True):
-        if not refresh_token:
-            raise ValueError("refresh_token is required for JQuantsSource.")
-        self.refresh_token = refresh_token
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        strict_data_quality: bool = True,
+        sleep_sec: float = 0.3,
+    ):
+        if not api_key:
+            raise ValueError("JQUANTS_API_KEY is required for JQuantsSource (V2).")
+        self.api_key = api_key
         self.strict_data_quality = strict_data_quality
-        self._id_token: str | None = None
-        self._id_token_at: datetime | None = None
+        self.sleep_sec = sleep_sec
         self._session = _requests_session_with_retry()
 
-    def _auth(self) -> str:
-        now = datetime.utcnow()
-        if (
-            self._id_token
-            and self._id_token_at
-            and now - self._id_token_at < self._ID_TOKEN_TTL
-        ):
-            return self._id_token
+    def _headers(self) -> dict[str, str]:
+        return {"x-api-key": self.api_key}
 
-        r = self._session.post(
-            f"{self.BASE}/auth/refresh_token",
-            params={"refreshtoken": self.refresh_token},
+    def _get_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        r = self._session.get(
+            f"{self.BASE}{path}",
+            params=params,
+            headers=self._headers(),
             timeout=30,
         )
+        if r.status_code == 401:
+            raise PermissionError(
+                "J-Quants API Key が無効です。ダッシュボードで再発行してください。"
+            )
+        if r.status_code == 429:
+            log.warning("J-Quants rate limited (429). params=%s", params)
         r.raise_for_status()
         js = r.json()
-        self._id_token = str(js["idToken"])
-        self._id_token_at = now
-        return self._id_token
+        if not isinstance(js, dict):
+            raise TypeError("J-Quants response must be a JSON object.")
+        return js
 
-    def _fetch_code(
-        self, code: str, start: date, end: date, headers: dict
-    ) -> pd.DataFrame:
+    def _fetch_code(self, code: str, start: date, end: date) -> pd.DataFrame:
         rows: list[dict[str, Any]] = []
         pagination_key: str | None = None
+        jq_code = _to_jquants_code(code)
 
         while True:
             params: dict[str, Any] = {
-                "code": code,
-                "from": str(start),
-                "to": str(end),
+                "code": jq_code,
+                "from": start.isoformat(),
+                "to": end.isoformat(),
             }
             if pagination_key:
                 params["pagination_key"] = pagination_key
 
-            r = self._session.get(
-                f"{self.BASE}/prices/daily_quotes",
-                params=params,
-                headers=headers,
-                timeout=30,
-            )
-            r.raise_for_status()
-
-            js = r.json()
-            batch = js.get("daily_quotes", [])
+            js = self._get_json("/equities/bars/daily", params)
+            batch = js.get("data", [])
+            if batch is None:
+                batch = []
             if not isinstance(batch, list):
-                raise TypeError("J-Quants daily_quotes must be a list.")
+                raise TypeError("J-Quants data must be a list.")
 
             rows.extend(batch)
 
             pagination_key = js.get("pagination_key")
             if not pagination_key:
                 break
-
-            time.sleep(0.2)
+            time.sleep(self.sleep_sec)
 
         return pd.DataFrame(rows)
 
     def fetch_daily(self, codes: list[str], start: date, end: date) -> pd.DataFrame:
-        token = self._auth()
-        headers = {"Authorization": f"Bearer {token}"}
+        if not codes:
+            return _empty_prices()
 
         frames: list[pd.DataFrame] = []
+        failed: list[str] = []
 
         for raw_code in codes:
             c = normalize_code(raw_code)
             try:
-                df = self._fetch_code(c, start, end, headers)
-                std = _standardize_jquants_frame(df)
-                if not std.empty:
+                df = self._fetch_code(c, start, end)
+                std = _standardize_jquants_v2_frame(df)
+                if std.empty:
+                    failed.append(c)
+                else:
                     frames.append(std)
             except Exception as exc:
                 log.warning("J-Quants fetch failed: code=%s error=%s", c, exc)
+                failed.append(c)
                 continue
+
+            # プラン別レート制限対策（Free=5req/min 等）
+            time.sleep(self.sleep_sec)
+
+        if failed:
+            log.warning(
+                "J-Quants failed/empty for %d codes (show 10): %s",
+                len(failed),
+                failed[:10],
+            )
 
         if not frames:
             return _empty_prices()
 
         out = pd.concat(frames, ignore_index=True)
+        out = out[out["date"] <= end.isoformat()]
         return validate_prices(out, strict=self.strict_data_quality)
