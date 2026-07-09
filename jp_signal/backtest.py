@@ -4,21 +4,30 @@
   1. エグジット（決済）にも反対売買のマーケットインパクトを適用（往復コスト計上）。
   2. _get_future_row が (row, exit_date) を返し、exit 日の前日 ADV を分母に使用。
   3. スプレッド/手数料フックを追加（デフォルト0だが将来拡張のため引数化）。
+  4. require_liquidity_data: 初日エントリーなど流動性データ欠損時をスキップ可。
+  5. 必須シグナル列のバリデーションを追加。
+  6. 不正な side/qty に対する明示的なステータスを追加。
 
 約定・コストモデル:
-  - FR-BT-01: 買い指値 P は当日安値 < P で約定（同値未約定は保守仮定。感度分析を別途行うこと）。
+  - FR-BT-01: 買い指値 P は当日安値 < P で約定（同値未約定は保守仮定）。
               売り指値 P は当日高値 > P で約定（同値未約定）。
   - FR-BT-02: 売買手数料はデフォルト0（commission_bp で変更可）。
   - FR-BT-03: 信用金利/貸株料 年率2%（日次 = rate/365）、オーバーナイト保有日数で計上。
   - FR-BT-04: マーケットインパクト sqrt則 impact_bp = k * sqrt(order_value / adv)。
-              k はデータソース依存の較正値。yfinance 近似 turnover と JQuants 実測は別較正。
-  - FR-BT-05: 売り戦略は shortability(is_margin_lendable=1 かつ short_restricted=0) の銘柄のみ。
+              k はデータソース依存の較正値。
+  - FR-BT-05: 売り戦略は shortability の確認された銘柄のみ。
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+
+_REQUIRED_SIGNAL_COLS = {
+    "code", "date", "side", "qty", "order_type", "limit_price", "holding_days",
+}
+
+_VALID_SIDES = {"BUY", "SELL"}
 
 
 class Backtester:
@@ -31,12 +40,14 @@ class Backtester:
         annual_lending_rate: float = 0.02,
         commission_bp: float = 0.0,
         half_spread_bp: float = 0.0,
+        require_liquidity_data: bool = True,
     ):
         self.k = impact_k_bp
         self.daily_int = annual_interest_rate / 365.0
         self.daily_lend = annual_lending_rate / 365.0
         self.commission_bp = commission_bp
         self.half_spread_bp = half_spread_bp
+        self.require_liquidity_data = require_liquidity_data
 
     # ------------------------------------------------------------ fill models
     @staticmethod
@@ -96,6 +107,19 @@ class Backtester:
         exit_date = fut.index[holding_days - 1]
         return exit_row, exit_date
 
+    def _latest_shortability_before(
+        self, sh: pd.DataFrame, code: str, d
+    ) -> dict | None:
+        """指定日付 d 以前の直近の shortability スナップショットを返す。"""
+        try:
+            g = sh.loc[code]
+        except KeyError:
+            return None
+        prev = g.loc[g.index <= d]
+        if prev.empty:
+            return None
+        return dict(prev.iloc[-1])
+
     def _entry_price(self, row, sig, adv: float, side_sign: int):
         """エントリー約定価格を返す。約定しない場合は None。"""
         order_type = sig.get("order_type", "MKT_OPEN")
@@ -137,6 +161,13 @@ class Backtester:
         if signals is None or signals.empty or prices is None or prices.empty:
             return pd.DataFrame()
 
+        # 必須列のチェック
+        missing_cols = _REQUIRED_SIGNAL_COLS - set(signals.columns)
+        if missing_cols:
+            raise ValueError(
+                f"signals に必須列が不足: {missing_cols}"
+            )
+
         px = prices.copy()
         px["date"] = pd.to_datetime(px["date"])
         px = px.set_index(["code", "date"]).sort_index()
@@ -152,19 +183,36 @@ class Backtester:
         for _, s in signals.iterrows():
             code = s["code"]
             d = pd.to_datetime(s["date"])
+
+            # side バリデーション
+            if s["side"] not in _VALID_SIDES:
+                results.append({**s.to_dict(), "status": "INVALID_SIDE"})
+                continue
+
+            # qty バリデーション
+            qty = s.get("qty", 0)
+            if qty <= 0:
+                results.append({**s.to_dict(), "status": "INVALID_QTY"})
+                continue
+
             if (code, d) not in px.index:
                 results.append({**s.to_dict(), "status": "NO_PRICE_DATA"})
                 continue
             row = px.loc[(code, d)]
             adv = self._prev_turnover(px, code, d)
 
-            # 売り可否チェック（FR-BT-05）。データ欠損時は保守側=売り不可。
+            # 流動性データ不足チェック（require_liquidity_data=True かつ ADV=0）
+            if self.require_liquidity_data and adv <= 0:
+                results.append({**s.to_dict(), "status": "NO_ENTRY_LIQUIDITY_DATA"})
+                continue
+
+            # 売り可否チェック（FR-BT-05）。最新スナップショットを d 以前から探索。
             if s["side"] == "SELL":
+                snap = self._latest_shortability_before(sh, code, d) if sh is not None else None
                 shortable = (
-                    sh is not None
-                    and (code, d) in sh.index
-                    and int(sh.loc[(code, d), "is_margin_lendable"]) == 1
-                    and int(sh.loc[(code, d), "short_restricted"]) == 0
+                    snap is not None
+                    and int(snap["is_margin_lendable"]) == 1
+                    and int(snap["short_restricted"]) == 0
                 )
                 if not shortable:
                     results.append({**s.to_dict(), "status": "SKIP_NOT_SHORTABLE"})
@@ -182,7 +230,6 @@ class Backtester:
                 results.append({**s.to_dict(), "status": "NO_EXIT_DATA"})
                 continue
 
-            qty = s["qty"]
             # 決済は反対売買。exit 日の前日 ADV を分母に使う。
             exit_base = float(exit_row["close"])
             exit_adv = self._prev_turnover(px, code, exit_date)

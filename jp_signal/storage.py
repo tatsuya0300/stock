@@ -1,13 +1,9 @@
-"""SQLite 永続化レイヤ（FR-DATA-03/05）。改訂版。
+"""SQLite 永続化レイヤ。
 
-価格（prices）・売り可否スナップショット（shortability）・約定記録（fills）を保持する。
-
-改訂点:
-  - prices テーブルに adj_close 列を追加（分割・配当調整後終値）。
-    リターン計算は adj_close、約定金額は生 open/close を使う。
-  - upsert_prices / upsert_shortability を固定名ステージングテーブルから
-    executemany + トランザクションに変更（cron 多重起動時の衝突・残留を回避）。
-  - sqlite3.connect を check_same_thread=False + timeout + WAL でスレッド安全化。
+schema v2:
+- raw OHLC と adjusted OHLC を分離
+- signals/orders/fills を追加
+- INSERT OR REPLACE を避け、ON CONFLICT DO UPDATE を使用
 """
 
 from __future__ import annotations
@@ -17,113 +13,363 @@ from pathlib import Path
 
 import pandas as pd
 
+SCHEMA_VERSION = 2
+
+PRICE_COLS = [
+    "code",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "adj_open",
+    "adj_high",
+    "adj_low",
+    "adj_close",
+    "volume",
+    "turnover",
+]
+
+SHORT_COLS = ["code", "date", "is_margin_lendable", "short_restricted"]
+
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS prices (
     code TEXT NOT NULL,
     date TEXT NOT NULL,
-    open REAL, high REAL, low REAL, close REAL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    adj_open REAL,
+    adj_high REAL,
+    adj_low REAL,
     adj_close REAL,
-    volume REAL, turnover REAL,
+    volume REAL,
+    turnover REAL,
     PRIMARY KEY (code, date)
 );
+
 CREATE TABLE IF NOT EXISTS shortability (
     code TEXT NOT NULL,
     date TEXT NOT NULL,
-    is_margin_lendable INTEGER,     -- 1: 貸借銘柄, 0: 制度信用のみ, NULL: 不明
-    short_restricted   INTEGER,     -- 1: 新規売り停止
+    is_margin_lendable INTEGER,
+    short_restricted INTEGER,
     PRIMARY KEY (code, date)
 );
+
+CREATE TABLE IF NOT EXISTS signals (
+    run_id TEXT NOT NULL,
+    signal_asof_date TEXT NOT NULL,
+    code TEXT NOT NULL,
+    side TEXT NOT NULL,
+    score REAL,
+    model_name TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+    run_id TEXT NOT NULL,
+    order_date TEXT NOT NULL,
+    signal_asof_date TEXT,
+    code TEXT NOT NULL,
+    name TEXT,
+    side TEXT NOT NULL,
+    order_type TEXT NOT NULL,
+    qty INTEGER NOT NULL,
+    ref_price REAL,
+    value_yen REAL,
+    shortable INTEGER,
+    warn TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS fills (
-    trade_date TEXT, code TEXT, side TEXT,
-    qty INTEGER, price REAL, note TEXT
+    run_id TEXT,
+    trade_date TEXT,
+    code TEXT,
+    side TEXT,
+    qty INTEGER,
+    price REAL,
+    note TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 """
 
-_PRICE_COLS = [
-    "code", "date", "open", "high", "low", "close",
-    "adj_close", "volume", "turnover",
-]
-_SHORT_COLS = ["code", "date", "is_margin_lendable", "short_restricted"]
-
 
 class Storage:
-    """SQLite ベースの永続化ストア。"""
-
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        # cron 多重起動やスレッド利用に備え check_same_thread=False + タイムアウト
         self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA foreign_keys=ON;")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+        self.set_metadata("schema_version", str(SCHEMA_VERSION))
 
-    # ------------------------------------------------------------------ prices
-    def upsert_prices(self, df: pd.DataFrame) -> None:
-        """price を UPSERT する。ステージングテーブルを使わず executemany で行う。
+    def set_metadata(self, key: str, value: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
 
-        df columns: code,date,open,high,low,close,adj_close,volume,turnover
-        adj_close が無い（旧スキーマ由来）場合は close で補完する。
+    def get_metadata(self, key: str, default: str | None = None) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return default
+        return str(row[0])
+
+    def _table_columns(self, table: str) -> set[str]:
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {r[1] for r in rows}
+
+    def _table_exists(self, table: str) -> bool:
+        row = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+    def _migrate(self) -> None:
+        """既存v1 DBからv2への最低限の移行。
+
+        旧pricesにadj_closeのみがある場合、adj_open/high/lowをraw値で補完する。
         """
+        if not self._table_exists("prices"):
+            return
+
+        cols = self._table_columns("prices")
+        needed = {
+            "adj_open": "REAL",
+            "adj_high": "REAL",
+            "adj_low": "REAL",
+            "adj_close": "REAL",
+        }
+
+        with self.conn:
+            for col, typ in needed.items():
+                if col not in cols:
+                    self.conn.execute(f"ALTER TABLE prices ADD COLUMN {col} {typ}")
+
+            self.conn.execute("UPDATE prices SET adj_open = open WHERE adj_open IS NULL")
+            self.conn.execute("UPDATE prices SET adj_high = high WHERE adj_high IS NULL")
+            self.conn.execute("UPDATE prices SET adj_low = low WHERE adj_low IS NULL")
+            self.conn.execute("UPDATE prices SET adj_close = close WHERE adj_close IS NULL")
+
+    def upsert_prices(self, df: pd.DataFrame) -> None:
         if df is None or df.empty:
             return
-        df = df.copy()
-        if "adj_close" not in df.columns:
-            df["adj_close"] = df["close"]
-        df = df[_PRICE_COLS]
-        records = list(df.itertuples(index=False, name=None))
-        placeholders = ",".join("?" * len(_PRICE_COLS))
-        cols = ",".join(_PRICE_COLS)
-        with self.conn:  # トランザクション自動コミット/ロールバック
-            self.conn.executemany(
-                f"INSERT OR REPLACE INTO prices ({cols}) VALUES ({placeholders})",
-                records,
-            )
+
+        x = df.copy()
+
+        # 旧形式互換: adj_* がなければ raw または close で補完
+        for c in ["adj_open", "adj_high", "adj_low", "adj_close"]:
+            if c not in x.columns:
+                if c == "adj_close":
+                    x[c] = x["close"]
+                else:
+                    raw = c.replace("adj_", "")
+                    x[c] = x[raw]
+
+        x["code"] = x["code"].astype(str).str.strip()
+        x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
+        x = x[PRICE_COLS]
+
+        records = list(x.itertuples(index=False, name=None))
+
+        sql = """
+        INSERT INTO prices (
+            code, date, open, high, low, close,
+            adj_open, adj_high, adj_low, adj_close,
+            volume, turnover
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code, date) DO UPDATE SET
+            open = excluded.open,
+            high = excluded.high,
+            low = excluded.low,
+            close = excluded.close,
+            adj_open = excluded.adj_open,
+            adj_high = excluded.adj_high,
+            adj_low = excluded.adj_low,
+            adj_close = excluded.adj_close,
+            volume = excluded.volume,
+            turnover = excluded.turnover
+        """
+
+        with self.conn:
+            self.conn.executemany(sql, records)
 
     def load_prices(self, codes: list[str], start: str, end: str) -> pd.DataFrame:
         if not codes:
-            return pd.DataFrame(columns=_PRICE_COLS)
+            return pd.DataFrame(columns=PRICE_COLS)
+
+        codes = [str(c) for c in codes]
         placeholders = ",".join("?" * len(codes))
         q = f"""
-        SELECT * FROM prices
+        SELECT {", ".join(PRICE_COLS)}
+        FROM prices
         WHERE code IN ({placeholders})
           AND date BETWEEN ? AND ?
         ORDER BY code, date
         """
         return pd.read_sql(q, self.conn, params=[*codes, start, end])
 
-    # ------------------------------------------------------------ shortability
     def upsert_shortability(self, df: pd.DataFrame) -> None:
         if df is None or df.empty:
             return
-        df = df[_SHORT_COLS].copy()
-        records = list(df.itertuples(index=False, name=None))
-        placeholders = ",".join("?" * len(_SHORT_COLS))
-        cols = ",".join(_SHORT_COLS)
+
+        x = df.copy()
+        x["code"] = x["code"].astype(str).str.strip()
+        x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
+        x = x[SHORT_COLS]
+
+        records = list(x.itertuples(index=False, name=None))
+
+        sql = """
+        INSERT INTO shortability (
+            code, date, is_margin_lendable, short_restricted
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(code, date) DO UPDATE SET
+            is_margin_lendable = excluded.is_margin_lendable,
+            short_restricted = excluded.short_restricted
+        """
+
         with self.conn:
-            self.conn.executemany(
-                f"INSERT OR REPLACE INTO shortability ({cols}) VALUES ({placeholders})",
-                records,
-            )
+            self.conn.executemany(sql, records)
 
     def load_shortability(self, codes: list[str], start: str, end: str) -> pd.DataFrame:
         if not codes:
-            return pd.DataFrame(columns=_SHORT_COLS)
+            return pd.DataFrame(columns=SHORT_COLS)
+
+        codes = [str(c) for c in codes]
         placeholders = ",".join("?" * len(codes))
         q = f"""
-        SELECT * FROM shortability
+        SELECT {", ".join(SHORT_COLS)}
+        FROM shortability
         WHERE code IN ({placeholders})
           AND date BETWEEN ? AND ?
         ORDER BY code, date
         """
         return pd.read_sql(q, self.conn, params=[*codes, start, end])
 
-    # ------------------------------------------------------------------- fills
-    def append_fill(self, trade_date: str, code: str, side: str,
-                    qty: int, price: float, note: str = "") -> None:
+    def append_signals(
+        self,
+        run_id: str,
+        signals: pd.DataFrame,
+        signal_asof_date: str,
+        model_name: str = "",
+    ) -> None:
+        if signals is None or signals.empty:
+            return
+
+        required = {"code", "side"}
+        missing = required - set(signals.columns)
+        if missing:
+            raise ValueError(f"signals missing columns: {sorted(missing)}")
+
+        x = signals.copy()
+        x["run_id"] = run_id
+        x["signal_asof_date"] = signal_asof_date
+        x["model_name"] = model_name
+
+        if "score" not in x.columns:
+            x["score"] = None
+
+        cols = [
+            "run_id",
+            "signal_asof_date",
+            "code",
+            "side",
+            "score",
+            "model_name",
+        ]
+
+        x["code"] = x["code"].astype(str).str.strip()
+        x["side"] = x["side"].astype(str).str.upper()
+
+        records = list(x[cols].itertuples(index=False, name=None))
+        placeholders = ",".join("?" * len(cols))
+
+        with self.conn:
+            self.conn.executemany(
+                f"INSERT INTO signals ({','.join(cols)}) VALUES ({placeholders})",
+                records,
+            )
+
+    def append_orders(self, run_id: str, orders: pd.DataFrame) -> None:
+        if orders is None or orders.empty:
+            return
+
+        x = orders.copy()
+        x["run_id"] = run_id
+
+        if "shortable" not in x.columns:
+            x["shortable"] = False
+        x["shortable"] = x["shortable"].fillna(False).astype(bool).astype(int)
+
+        cols = [
+            "run_id",
+            "order_date",
+            "signal_asof_date",
+            "code",
+            "name",
+            "side",
+            "order_type",
+            "qty",
+            "ref_price",
+            "value_yen",
+            "shortable",
+            "warn",
+        ]
+
+        for c in cols:
+            if c not in x.columns:
+                x[c] = None
+
+        x["code"] = x["code"].astype(str).str.strip()
+        x["side"] = x["side"].astype(str).str.upper()
+
+        records = list(x[cols].itertuples(index=False, name=None))
+        placeholders = ",".join("?" * len(cols))
+
+        with self.conn:
+            self.conn.executemany(
+                f"INSERT INTO orders ({','.join(cols)}) VALUES ({placeholders})",
+                records,
+            )
+
+    def append_fill(
+        self,
+        trade_date: str,
+        code: str,
+        side: str,
+        qty: int,
+        price: float,
+        note: str = "",
+        run_id: str | None = None,
+    ) -> None:
         with self.conn:
             self.conn.execute(
-                "INSERT INTO fills (trade_date, code, side, qty, price, note) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (trade_date, code, side, qty, price, note),
+                """
+                INSERT INTO fills (run_id, trade_date, code, side, qty, price, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, trade_date, str(code), side.upper(), int(qty), float(price), note),
             )
 
     def close(self) -> None:

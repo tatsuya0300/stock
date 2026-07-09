@@ -1,11 +1,24 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Env
 .venv/
 venv/
+.env
+
+# Data / local artifacts
 data/*.sqlite
-data/*.sqlite-wal
 data/*.sqlite-shm
+data/*.sqlite-wal
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.lock
 data/topix500.csv
-*.log
+
+# OS
 .DS_Store
