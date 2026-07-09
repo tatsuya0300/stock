@@ -1,13 +1,15 @@
 """バックテストエンジン（FR-BT-01〜06）。
 
 約定・コストモデル:
-  - FR-BT-01: 買い指値 P は当日安値 > P で約定。
-  - FR-BT-02: commission_bp
+  - FR-BT-01: 買い指値 P は当日安値 < P で約定（同値未約定）。
+  - FR-BT-02: commission_bp / half_spread_bp
   - FR-BT-03: 金利/貸株 年率を /365 で日次化（暦日近似）
   - FR-BT-04: impact_bp = k * sqrt(order_value / adv)
               adv は直近 adv_window 日の平均売買代金
   - FR-BT-05: 売りは shortability 確認済みのみ
-  - FR-BT-06: 日計り（holding_days=1）の carry=0、複数日は実経過暦日数
+  - FR-BT-06: holding_days=1 は「翌営業日 close 決済」のオーバーナイト。
+              zero_carry_for_intraday=True のとき carry=0（厳密な日計りではない）。
+              複数日は実経過暦日数で carry を計上。
 """
 
 from __future__ import annotations

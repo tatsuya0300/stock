@@ -128,8 +128,10 @@ def signals_to_orders(
         if univ_idx is not None and code in univ_idx.index:
             name = str(univ_idx.loc[code, "name"])
 
+        # name は live/BT 共通で常に付与（通知・DB用）
         row: dict = {
             "code": code,
+            "name": name,
             "side": str(r["side"]).upper(),
             "order_type": order_type,
             "qty": qty,
@@ -140,9 +142,9 @@ def signals_to_orders(
             "shortable": shortable,
         }
 
+        # BT専用列のみ for_backtest 時に付与
         if for_backtest:
             row["date"] = str(as_of_d)
-            row["name"] = name
             row["limit_price"] = r.get("limit_price", None)
             row["holding_days"] = holding_days
 

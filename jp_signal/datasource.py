@@ -7,6 +7,7 @@
 
 注意:
 - yfinance の end は exclusive。
+- yfinance の turnover は close*volume の近似（本番は JQuants Va/TurnoverValue を使用）。
 - J-Quants は V2 API（API Key 認証）を使用する。
   公式: https://jpx-jquants.com/en/spec/migration-v1-v2
         https://jpx-jquants.com/en/spec/eq-bars-daily
@@ -28,6 +29,15 @@ from .universe import normalize_code
 log = logging.getLogger(__name__)
 
 OUTPUT_COLS = REQUIRED_PRICE_COLS
+
+# J-Quants プラン別の最小リクエスト間隔（秒）。公式レート制限に合わせて保守側。
+# Free: 5 req/min → 12s、Light: 60/min → 1s、Standard: 120/min → 0.5s
+_JQUANTS_PLAN_MIN_INTERVAL_SEC: dict[str, float] = {
+    "free": 12.0,
+    "light": 1.0,
+    "standard": 0.5,
+    "premium": 0.2,
+}
 
 
 class PriceDataSource(ABC):
@@ -82,6 +92,7 @@ def _standardize_yfinance_frame(df: pd.DataFrame, code: str) -> pd.DataFrame:
 
     yfinance は raw OHLC + Adj Close を返す。
     adj_open/high/low は adj_close/close 比率で近似（特徴量用途限定）。
+    turnover は close*volume の近似であり、売買代金の真値ではない。
     """
     if df is None or df.empty:
         return _empty_prices()
@@ -118,6 +129,7 @@ def _standardize_yfinance_frame(df: pd.DataFrame, code: str) -> pd.DataFrame:
     x["adj_high"] = pd.to_numeric(x["high"], errors="coerce") * ratio
     x["adj_low"] = pd.to_numeric(x["low"], errors="coerce") * ratio
     x["code"] = normalize_code(code)
+    # 近似: 真の売買代金ではない。本番インパクト算定は JQuants を使うこと。
     x["turnover"] = close * pd.to_numeric(x["volume"], errors="coerce")
     x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
 
@@ -210,13 +222,20 @@ def _standardize_jquants_v2_frame(df: pd.DataFrame) -> pd.DataFrame:
 class YFinanceSource(PriceDataSource):
     """プロトタイプ用 yfinance datasource。
 
-    yfinance.download の end は exclusive。
-    本クラス内で end を +1 day して inclusive にする。
+    注意:
+      turnover は close*volume の近似。
+      マーケットインパクト・ADV 上限の本番算定には使わないこと。
     """
+
+    # 近似フラグ（呼び出し側が本番判定に使える）
+    TURNOVER_IS_APPROXIMATE = True
 
     def __init__(self, *, strict_data_quality: bool = False, chunk_size: int = 50):
         self.strict_data_quality = strict_data_quality
         self.chunk_size = max(1, int(chunk_size))
+        log.warning(
+            "YFinanceSource: turnover=close*volume の近似。本番は JQuantsSource を使用。"
+        )
 
     def fetch_daily(self, codes: list[str], start: date, end: date) -> pd.DataFrame:
         import yfinance as yf
@@ -336,29 +355,67 @@ class JQuantsSource(PriceDataSource):
         self.api_key = api_key
         self.strict_data_quality = strict_data_quality
         self.sleep_sec = sleep_sec
+        self._last_request_ts = 0.0
+        self.max_retries_on_429 = 3
         self._session = _requests_session_with_retry()
 
     def _headers(self) -> dict[str, str]:
         return {"x-api-key": self.api_key}
 
+    def _throttle(self) -> None:
+        """プラン別最小間隔を保証。"""
+        elapsed = time.monotonic() - self._last_request_ts
+        wait = self.sleep_sec - elapsed
+        if wait > 0:
+            time.sleep(wait)
+
     def _get_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        r = self._session.get(
-            f"{self.BASE}{path}",
-            params=params,
-            headers=self._headers(),
-            timeout=30,
-        )
-        if r.status_code == 401:
-            raise PermissionError(
-                "J-Quants API Key が無効です。ダッシュボードで再発行してください。"
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries_on_429 + 1):
+            self._throttle()
+            r = self._session.get(
+                f"{self.BASE}{path}",
+                params=params,
+                headers=self._headers(),
+                timeout=30,
             )
-        if r.status_code == 429:
-            log.warning("J-Quants rate limited (429). params=%s", params)
-        r.raise_for_status()
-        js = r.json()
-        if not isinstance(js, dict):
-            raise TypeError("J-Quants response must be a JSON object.")
-        return js
+            self._last_request_ts = time.monotonic()
+
+            if r.status_code == 401:
+                raise PermissionError(
+                    "J-Quants API Key が無効です。ダッシュボードで再発行してください。"
+                )
+            if r.status_code == 429:
+                # Retry-After があれば尊重、無ければ指数バックオフ
+                retry_after = r.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        backoff = float(retry_after)
+                    except ValueError:
+                        backoff = self.sleep_sec * (2 ** attempt)
+                else:
+                    backoff = self.sleep_sec * (2 ** attempt)
+                backoff = min(max(backoff, self.sleep_sec), 120.0)
+                log.warning(
+                    "J-Quants rate limited (429). attempt=%d/%d sleep=%.1fs params=%s",
+                    attempt + 1,
+                    self.max_retries_on_429 + 1,
+                    backoff,
+                    params,
+                )
+                if attempt >= self.max_retries_on_429:
+                    r.raise_for_status()
+                time.sleep(backoff)
+                last_exc = RuntimeError("J-Quants 429 rate limit")
+                continue
+
+            r.raise_for_status()
+            js = r.json()
+            if not isinstance(js, dict):
+                raise TypeError("J-Quants response must be a JSON object.")
+            return js
+
+        raise RuntimeError(f"J-Quants request failed after retries: {last_exc}")
 
     def _fetch_code(self, code: str, start: date, end: date) -> pd.DataFrame:
         rows: list[dict[str, Any]] = []
@@ -386,7 +443,6 @@ class JQuantsSource(PriceDataSource):
             pagination_key = js.get("pagination_key")
             if not pagination_key:
                 break
-            time.sleep(self.sleep_sec)
 
         return pd.DataFrame(rows)
 
@@ -410,9 +466,6 @@ class JQuantsSource(PriceDataSource):
                 log.warning("J-Quants fetch failed: code=%s error=%s", c, exc)
                 failed.append(c)
                 continue
-
-            # プラン別レート制限対策（Free=5req/min 等）
-            time.sleep(self.sleep_sec)
 
         if failed:
             log.warning(

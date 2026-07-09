@@ -383,6 +383,127 @@ class Storage:
                 ),
             )
 
+    def load_orders(
+        self,
+        order_date: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> pd.DataFrame:
+        """orders を読み出す。order_date 優先、無ければ start/end。"""
+        cols = [
+            "run_id",
+            "order_date",
+            "signal_asof_date",
+            "code",
+            "name",
+            "side",
+            "order_type",
+            "qty",
+            "ref_price",
+            "value_yen",
+            "shortable",
+            "warn",
+            "created_at",
+        ]
+        if order_date:
+            q = f"""
+            SELECT {', '.join(cols)}
+            FROM orders
+            WHERE order_date = ?
+            ORDER BY code, side
+            """
+            return pd.read_sql(q, self.conn, params=[order_date])
+
+        if start and end:
+            q = f"""
+            SELECT {', '.join(cols)}
+            FROM orders
+            WHERE order_date BETWEEN ? AND ?
+            ORDER BY order_date, code, side
+            """
+            return pd.read_sql(q, self.conn, params=[start, end])
+
+        q = f"SELECT {', '.join(cols)} FROM orders ORDER BY order_date, code, side"
+        return pd.read_sql(q, self.conn)
+
+    def load_fills(
+        self,
+        trade_date: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> pd.DataFrame:
+        """fills を読み出す。trade_date 優先、無ければ start/end。"""
+        cols = [
+            "run_id",
+            "trade_date",
+            "code",
+            "side",
+            "qty",
+            "price",
+            "note",
+            "created_at",
+        ]
+        if trade_date:
+            q = f"""
+            SELECT {', '.join(cols)}
+            FROM fills
+            WHERE trade_date = ?
+            ORDER BY code, side
+            """
+            return pd.read_sql(q, self.conn, params=[trade_date])
+        if start and end:
+            q = f"""
+            SELECT {', '.join(cols)}
+            FROM fills
+            WHERE trade_date BETWEEN ? AND ?
+            ORDER BY trade_date, code
+            """
+            return pd.read_sql(q, self.conn, params=[start, end])
+        q = f"SELECT {', '.join(cols)} FROM fills ORDER BY trade_date, code"
+        return pd.read_sql(q, self.conn)
+
+    def import_fills_csv(self, path: str | Path) -> int:
+        """CSV から fills を一括取込。戻り値は取込件数。
+
+        必須列: trade_date, code, side, qty, price
+        任意列: note, run_id
+        """
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"fills CSV が見つかりません: {path}")
+
+        df = pd.read_csv(p, dtype={"code": str})
+        required = {"trade_date", "code", "side", "qty", "price"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"fills CSV に必須列が不足: {sorted(missing)}")
+
+        if "note" not in df.columns:
+            df["note"] = ""
+        if "run_id" not in df.columns:
+            df["run_id"] = None
+
+        n = 0
+        with self.conn:
+            for _, r in df.iterrows():
+                self.conn.execute(
+                    """
+                    INSERT INTO fills (run_id, trade_date, code, side, qty, price, note)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        None if pd.isna(r["run_id"]) else str(r["run_id"]),
+                        str(pd.to_datetime(r["trade_date"]).date()),
+                        str(r["code"]).strip(),
+                        str(r["side"]).upper(),
+                        int(r["qty"]),
+                        float(r["price"]),
+                        "" if pd.isna(r["note"]) else str(r["note"]),
+                    ),
+                )
+                n += 1
+        return n
+
     def close(self) -> None:
         self.conn.close()
 
