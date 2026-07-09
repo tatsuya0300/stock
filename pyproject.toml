@@ -9,19 +9,35 @@ ignore = [
     "E501",  # 行長は line-length に委ねる（日本語コメントで超過しやすい）
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = [
+    "UP",     # テストは古いスタイルの方が可読性が高い場合がある
+    "B",      # pytest の tmp_path 等で bugbear 警告が出うる
+]
+
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
 warn_unused_ignores = false
 check_untyped_defs = false
+no_warn_no_return = true
 
-# サードパーティ製スタブ（numpy/pandas 等）の解析は追わない。
-# ローカルの Python バージョンとスタブの組み合わせで無関係なエラーが出るのを防ぐ。
+# Perl-ish compatible warnings / numpy deprecation noise suppression
 [[tool.mypy.overrides]]
-module = ["numpy.*", "pandas.*", "yfinance.*", "requests.*", "urllib3.*", "yaml.*", "jpholiday.*"]
+module = [
+    "numpy.*", "pandas.*", "yfinance.*",
+    "requests.*", "urllib3.*", "yaml.*", "jpholiday.*",
+    "dateutil.*",
+]
 follow_imports = "skip"
 follow_imports_for_stubs = true
+warn_unused_ignores = false
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:numpy.*",
+    "ignore::DeprecationWarning:pandas.*",
+    "ignore::FutureWarning:yfinance.*",
+]

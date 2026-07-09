@@ -44,9 +44,12 @@ def validate_prices(
         raise ValueError(f"Missing required columns: {missing}")
 
     required = [c for c in REQUIRED_PRICE_COLS if c in df.columns]
-    for c in ["open", "high", "low", "close"]:
-        if c not in df.columns and "adj_" + c not in df.columns:
-            raise ValueError(f"Missing required price column: {c} or adj_{c}")
+    for c in ["code", "date", "open", "high", "low", "close"]:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column: {c}")
+    for c in ["adj_open", "adj_high", "adj_low", "adj_close"]:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column: {c}")
 
     # Validate high >= low
     valid_high_low = True

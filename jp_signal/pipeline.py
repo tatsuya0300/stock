@@ -1,6 +1,7 @@
 """日次パイプライン統合（FR-DATA + FR-MODEL + FR-SIZE + FR-NOTIFY）。
 
 寄前パイプライン: データ取得 → シグナル生成 → サイズ算定 → 通知。
+dry-run モードでは DB 書込と発注指示送信をスキップする。
 """
 
 from __future__ import annotations
@@ -8,7 +9,12 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pandas as pd
-import yaml
+
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore[assignment]
+
 
 from .calendar import is_tse_business_day
 from .datasource import JQuantsSource, YFinanceSource
@@ -20,6 +26,8 @@ from .universe import load_universe
 
 
 def load_config(path: str = "config.yaml") -> dict:
+    if yaml is None:
+        raise ImportError("PyYAML が必要です: pip install pyyaml")
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -33,16 +41,25 @@ def make_datasource(cfg: dict):
 def make_notifier(cfg: dict):
     ch = cfg["notify"]["channel"]
     if ch == "discord":
-        return DiscordNotifier(cfg["notify"]["discord_webhook"])
+        webhook = cfg["notify"].get("discord_webhook", "")
+        return DiscordNotifier(webhook)
     return ConsoleNotifier()
 
 
-def morning_pipeline(as_of: date, cfg: dict) -> None:
-    """寄前発注指示を生成し通知する。休場日は通知抑止（FR-NOTIFY）。"""
+def morning_pipeline(
+    as_of: date, cfg: dict, dry_run: bool = False
+) -> None:
+    """寄前発注指示を生成し通知する。休場日は通知抑止（FR-NOTIFY）。
+
+    Args:
+        as_of: 基準日。
+        cfg: 設定 dict。
+        dry_run: True の場合、DB 書込と発注指示送信を行わない。
+    """
     if not is_tse_business_day(as_of):
         return
 
-    storage = Storage(cfg["data"]["db_path"])
+    storage = Storage(cfg["data"]["db_path"]) if not dry_run else None
     ds = make_datasource(cfg)
     univ = load_universe(cfg["universe"]["file"])
     codes = univ["code"].tolist()
@@ -54,9 +71,11 @@ def morning_pipeline(as_of: date, cfg: dict) -> None:
     if df.empty:
         notifier.send("本日はシグナル生成不可", "データ取得失敗")
         return
-    storage.upsert_prices(df)
 
-    prices = storage.load_prices(codes, str(start), str(as_of))
+    if not dry_run and storage is not None:
+        storage.upsert_prices(df)
+
+    prices = df  # メモリ上のデータをそのまま使用（dry-run では DB に依存しない）
     model = MeanReversionRule(lookback=5, top_n=5)
     sig = model.generate(prices, as_of=str(as_of))
     if sig.empty:
@@ -105,4 +124,11 @@ def morning_pipeline(as_of: date, cfg: dict) -> None:
     if orders.empty:
         notifier.send("本日はシグナル生成不可", "サイズ算定後に0件")
         return
-    notifier.send(f"寄前発注指示 {as_of}", format_orders(orders))
+
+    if dry_run:
+        notifier.send(f"[DRY-RUN] 寄前発注指示 {as_of}", format_orders(orders))
+    else:
+        notifier.send(f"寄前発注指示 {as_of}", format_orders(orders))
+
+    if not dry_run and storage is not None:
+        storage.close()

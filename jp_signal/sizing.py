@@ -23,6 +23,7 @@ def compute_size(
     unit: int = 100,
     market_open_unit_cap: int = 50,
     is_market_open_order: bool = True,
+    enforce_market_open_unit_cap: bool = False,
 ) -> tuple[int, float, str]:
     """推奨発注サイズを返す。
 
@@ -32,13 +33,28 @@ def compute_size(
         adv_ratio: 目標額が未指定のときのデフォルト発注比率（例 0.001 = 前日代金の0.1%）。
         adv_ratio_cap: 前日代金に対する発注額の上限比率（例 0.002 = 0.2%）。
         target_notional: 上位ロジックが決めた目標発注額（円）。None なら turnover*adv_ratio。
-        unit: 単元株数。
+        unit: 単元株数。0 は拒否。
         market_open_unit_cap: 寄成で許容する最大単元数。
         is_market_open_order: 寄成注文か（True のときのみ寄成上限を警告）。
+        enforce_market_open_unit_cap: True の場合、寄成の単元上限を超える分をクリップする。
 
     Returns:
         (qty, order_value_yen, warn_message)
+
+    Raises:
+        ValueError: adv_ratio > adv_ratio_cap の場合、または
+                    target_notional < 0 の場合、または unit <= 0 の場合。
     """
+    # バリデーション
+    if adv_ratio > adv_ratio_cap:
+        raise ValueError(
+            f"adv_ratio ({adv_ratio}) が adv_ratio_cap ({adv_ratio_cap}) を超えています"
+        )
+    if target_notional is not None and target_notional < 0:
+        raise ValueError(f"target_notional ({target_notional}) は負の値にできません")
+    if unit <= 0:
+        raise ValueError(f"unit ({unit}) は正の整数である必要があります")
+
     if (
         ref_price is None
         or ref_price <= 0
@@ -57,6 +73,10 @@ def compute_size(
 
     warn = ""
     if is_market_open_order and unit > 0 and (qty // unit) > market_open_unit_cap:
-        warn = f"寄成{market_open_unit_cap}単元超過: 分割 or 指値を検討"
+        if enforce_market_open_unit_cap:
+            qty = market_open_unit_cap * unit
+            warn = f"寄成{market_open_unit_cap}単元超過: {qty}株にクリップ"
+        else:
+            warn = f"寄成{market_open_unit_cap}単元超過: 分割 or 指値を検討"
 
     return qty, qty * ref_price, warn
