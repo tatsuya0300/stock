@@ -37,19 +37,27 @@ def normalize_code(code: str) -> str:
 
 
 def load_universe(
-    path: str,
+    path_or_cfg: str | dict,
     as_of: str | None = None,
 ) -> pd.DataFrame:
     """CSV からユニバースを読み込む。
 
     Args:
-        path: CSV ファイル (code, name[, effective_from, effective_to])。
+        path_or_cfg: CSV パス、または config の universe セクション dict
+                     （key: file）。
         as_of: 指定日時点の有効な銘柄のみにフィルタ。
                未指定なら全件（effective_from/effective_to が無い古いCSVも読める）。
 
     Returns:
         code, name の DataFrame。code は正規化・ソート済み。
     """
+    if isinstance(path_or_cfg, dict):
+        path = path_or_cfg.get("file")
+        if not path:
+            raise ValueError("universe.file が設定されていません")
+    else:
+        path = path_or_cfg
+
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(
@@ -71,17 +79,15 @@ def load_universe(
             f"重複コード検出: {dupes['code'].unique().tolist()}"
         )
 
-    # point-in-time フィルタリング
+    # point-in-time フィルタリング（日付比較を厳密化）
     if as_of is not None:
         as_of_ts = pd.Timestamp(as_of)
         if "effective_from" in df.columns:
-            df = df[
-                (df["effective_from"].fillna("1900-01-01").apply(pd.Timestamp) <= as_of_ts)
-            ]
+            ef = pd.to_datetime(df["effective_from"].fillna("1900-01-01"))
+            df = df[ef <= as_of_ts]
         if "effective_to" in df.columns:
-            df = df[
-                (df["effective_to"].fillna("2099-12-31").apply(pd.Timestamp) >= as_of_ts)
-            ]
+            et = pd.to_datetime(df["effective_to"].fillna("2099-12-31"))
+            df = df[et >= as_of_ts]
 
     df = df.sort_values("code").reset_index(drop=True)
     return df[["code", "name"]]

@@ -1,8 +1,10 @@
 """SQLite 永続化レイヤ。
 
-schema v2:
+schema v3:
 - raw OHLC と adjusted OHLC を分離
 - signals/orders/fills を追加
+- signals/orders に PRIMARY KEY を追加し ON CONFLICT DO UPDATE を有効化
+- shortability テーブル
 - INSERT OR REPLACE を避け、ON CONFLICT DO UPDATE を使用
 """
 
@@ -13,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 PRICE_COLS = [
     "code",
@@ -31,7 +33,6 @@ PRICE_COLS = [
 ]
 
 SHORT_COLS = ["code", "date", "is_margin_lendable", "short_restricted"]
-
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (
@@ -70,7 +71,8 @@ CREATE TABLE IF NOT EXISTS signals (
     side TEXT NOT NULL,
     score REAL,
     model_name TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (signal_asof_date, code, side, model_name)
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -86,7 +88,8 @@ CREATE TABLE IF NOT EXISTS orders (
     value_yen REAL,
     shortable INTEGER,
     warn TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (order_date, code, side, order_type)
 );
 
 CREATE TABLE IF NOT EXISTS fills (
@@ -112,6 +115,10 @@ class Storage:
         self._migrate()
         self.set_metadata("schema_version", str(SCHEMA_VERSION))
 
+    def _initial_setup(self) -> None:
+        """完全新規DB用の初期セットアップ。"""
+        self.conn.executescript(SCHEMA)
+
     def set_metadata(self, key: str, value: str) -> None:
         with self.conn:
             self.conn.execute(
@@ -128,9 +135,7 @@ class Storage:
             "SELECT value FROM metadata WHERE key = ?",
             (key,),
         ).fetchone()
-        if row is None:
-            return default
-        return str(row[0])
+        return default if row is None else str(row[0])
 
     def _table_columns(self, table: str) -> set[str]:
         rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -144,10 +149,7 @@ class Storage:
         return row is not None
 
     def _migrate(self) -> None:
-        """既存v1 DBからv2への最低限の移行。
-
-        旧pricesにadj_closeのみがある場合、adj_open/high/lowをraw値で補完する。
-        """
+        """v1/v2 → v3 移行。"""
         if not self._table_exists("prices"):
             return
 
@@ -158,7 +160,6 @@ class Storage:
             "adj_low": "REAL",
             "adj_close": "REAL",
         }
-
         with self.conn:
             for col, typ in needed.items():
                 if col not in cols:
@@ -174,20 +175,16 @@ class Storage:
             return
 
         x = df.copy()
-
-        # 旧形式互換: adj_* がなければ raw または close で補完
         for c in ["adj_open", "adj_high", "adj_low", "adj_close"]:
             if c not in x.columns:
                 if c == "adj_close":
                     x[c] = x["close"]
                 else:
-                    raw = c.replace("adj_", "")
-                    x[c] = x[raw]
+                    x[c] = x[c.replace("adj_", "")]
 
         x["code"] = x["code"].astype(str).str.strip()
         x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
         x = x[PRICE_COLS]
-
         records = list(x.itertuples(index=False, name=None))
 
         sql = """
@@ -209,14 +206,12 @@ class Storage:
             volume = excluded.volume,
             turnover = excluded.turnover
         """
-
         with self.conn:
             self.conn.executemany(sql, records)
 
     def load_prices(self, codes: list[str], start: str, end: str) -> pd.DataFrame:
         if not codes:
             return pd.DataFrame(columns=PRICE_COLS)
-
         codes = [str(c) for c in codes]
         placeholders = ",".join("?" * len(codes))
         q = f"""
@@ -231,14 +226,11 @@ class Storage:
     def upsert_shortability(self, df: pd.DataFrame) -> None:
         if df is None or df.empty:
             return
-
         x = df.copy()
         x["code"] = x["code"].astype(str).str.strip()
         x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
         x = x[SHORT_COLS]
-
         records = list(x.itertuples(index=False, name=None))
-
         sql = """
         INSERT INTO shortability (
             code, date, is_margin_lendable, short_restricted
@@ -248,14 +240,12 @@ class Storage:
             is_margin_lendable = excluded.is_margin_lendable,
             short_restricted = excluded.short_restricted
         """
-
         with self.conn:
             self.conn.executemany(sql, records)
 
     def load_shortability(self, codes: list[str], start: str, end: str) -> pd.DataFrame:
         if not codes:
             return pd.DataFrame(columns=SHORT_COLS)
-
         codes = [str(c) for c in codes]
         placeholders = ",".join("?" * len(codes))
         q = f"""
@@ -285,8 +275,7 @@ class Storage:
         x = signals.copy()
         x["run_id"] = run_id
         x["signal_asof_date"] = signal_asof_date
-        x["model_name"] = model_name
-
+        x["model_name"] = model_name or ""
         if "score" not in x.columns:
             x["score"] = None
 
@@ -298,18 +287,22 @@ class Storage:
             "score",
             "model_name",
         ]
-
         x["code"] = x["code"].astype(str).str.strip()
         x["side"] = x["side"].astype(str).str.upper()
-
         records = list(x[cols].itertuples(index=False, name=None))
-        placeholders = ",".join("?" * len(cols))
 
+        sql = """
+        INSERT INTO signals (
+            run_id, signal_asof_date, code, side, score, model_name
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(signal_asof_date, code, side, model_name) DO UPDATE SET
+            run_id = excluded.run_id,
+            score = excluded.score,
+            created_at = CURRENT_TIMESTAMP
+        """
         with self.conn:
-            self.conn.executemany(
-                f"INSERT INTO signals ({','.join(cols)}) VALUES ({placeholders})",
-                records,
-            )
+            self.conn.executemany(sql, records)
 
     def append_orders(self, run_id: str, orders: pd.DataFrame) -> None:
         if orders is None or orders.empty:
@@ -317,7 +310,6 @@ class Storage:
 
         x = orders.copy()
         x["run_id"] = run_id
-
         if "shortable" not in x.columns:
             x["shortable"] = False
         x["shortable"] = x["shortable"].fillna(False).astype(bool).astype(int)
@@ -336,22 +328,33 @@ class Storage:
             "shortable",
             "warn",
         ]
-
         for c in cols:
             if c not in x.columns:
                 x[c] = None
 
         x["code"] = x["code"].astype(str).str.strip()
         x["side"] = x["side"].astype(str).str.upper()
-
         records = list(x[cols].itertuples(index=False, name=None))
-        placeholders = ",".join("?" * len(cols))
 
+        sql = """
+        INSERT INTO orders (
+            run_id, order_date, signal_asof_date, code, name, side, order_type,
+            qty, ref_price, value_yen, shortable, warn
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(order_date, code, side, order_type) DO UPDATE SET
+            run_id = excluded.run_id,
+            signal_asof_date = excluded.signal_asof_date,
+            name = excluded.name,
+            qty = excluded.qty,
+            ref_price = excluded.ref_price,
+            value_yen = excluded.value_yen,
+            shortable = excluded.shortable,
+            warn = excluded.warn,
+            created_at = CURRENT_TIMESTAMP
+        """
         with self.conn:
-            self.conn.executemany(
-                f"INSERT INTO orders ({','.join(cols)}) VALUES ({placeholders})",
-                records,
-            )
+            self.conn.executemany(sql, records)
 
     def append_fill(
         self,
@@ -369,8 +372,35 @@ class Storage:
                 INSERT INTO fills (run_id, trade_date, code, side, qty, price, note)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, trade_date, str(code), side.upper(), int(qty), float(price), note),
+                (
+                    run_id,
+                    trade_date,
+                    str(code),
+                    side.upper(),
+                    int(qty),
+                    float(price),
+                    note,
+                ),
             )
 
     def close(self) -> None:
         self.conn.close()
+
+    def __enter__(self) -> Storage:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def max_price_date(self, codes: list[str] | None = None) -> str | None:
+        """prices テーブルの最大 date を返す。無ければ None。"""
+        if codes:
+            codes = [str(c) for c in codes]
+            placeholders = ",".join("?" * len(codes))
+            q = f"SELECT MAX(date) FROM prices WHERE code IN ({placeholders})"
+            row = self.conn.execute(q, codes).fetchone()
+        else:
+            row = self.conn.execute("SELECT MAX(date) FROM prices").fetchone()
+        if row is None or row[0] is None:
+            return None
+        return str(row[0])

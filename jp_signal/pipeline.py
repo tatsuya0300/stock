@@ -1,11 +1,18 @@
 """日次パイプライン統合（FR-DATA + FR-MODEL + FR-SIZE + FR-NOTIFY）。
 
-寄前パイプライン: データ取得 → シグナル生成 → サイズ算定 → 通知。
+寄前パイプライン: データ取得 → シグナル生成 → サイズ算定 → リスク制限 → 通知。
 dry-run モードでは DB 書込と発注指示送信をスキップする。
+戻り値として最終 orders を返す（テスト容易性）。
+
+v2 変更点:
+  - order_builder.signals_to_orders に注文生成を一元化（live/BT 同一ロジック）
+  - 価格取得を差分更新に（storage に日付が揃っている分は再取得しない）
+  - storage の context manager 使用
 """
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import date, timedelta
 
@@ -15,14 +22,20 @@ from .calendar import is_tse_business_day
 from .datasource import JQuantsSource, YFinanceSource
 from .model import MeanReversionRule
 from .notifier import ConsoleNotifier, DiscordNotifier, format_orders
-from .sizing import compute_size
+from .order_builder import signals_to_orders
+from .risk import risk_config_from_dict
 from .storage import Storage
 from .universe import load_universe
+
+log = logging.getLogger(__name__)
+
+# 初回取得時の過去日数（足りなければ随時追加）
+_INITIAL_HISTORY_CALENDAR_DAYS = 400
 
 
 def make_datasource(cfg: dict):
     if cfg["data"]["source"] == "jquants":
-        return JQuantsSource(cfg["data"]["jquants_refresh_token"])
+        return JQuantsSource(cfg["data"]["jquants_api_key"])
     return YFinanceSource()
 
 
@@ -34,103 +47,132 @@ def make_notifier(cfg: dict):
     return ConsoleNotifier()
 
 
+def _fetch_prices_incremental(
+    ds,
+    storage: Storage | None,
+    codes: list[str],
+    as_of: date,
+    *,
+    dry_run: bool = False,
+) -> pd.DataFrame:
+    """DB にあれば差分取得、無ければ初期ヒストリを取得。"""
+    if dry_run or storage is None:
+        start = as_of - timedelta(days=_INITIAL_HISTORY_CALENDAR_DAYS)
+        # datasource 側で inclusive に正規化される前提
+        return ds.fetch_daily(codes, start, as_of)
+
+    # 既存の最終日を確認
+    existing = storage.load_prices(
+        codes,
+        start=(as_of - timedelta(days=_INITIAL_HISTORY_CALENDAR_DAYS)).isoformat(),
+        end=as_of.isoformat(),
+    )
+
+    if existing.empty:
+        start = as_of - timedelta(days=_INITIAL_HISTORY_CALENDAR_DAYS)
+        fresh = ds.fetch_daily(codes, start, as_of)
+        if not fresh.empty:
+            storage.upsert_prices(fresh)
+        return fresh
+
+    last_date = pd.to_datetime(existing["date"]).max().date()
+    if last_date >= as_of:
+        # 当日まで揃っている
+        return existing[existing["date"] <= str(as_of)]
+
+    # 不足分のみ取得
+    start = last_date + timedelta(days=1)
+    fresh = ds.fetch_daily(codes, start, as_of)
+    if not fresh.empty:
+        storage.upsert_prices(fresh)
+    combined = pd.concat([existing, fresh], ignore_index=True)
+    return combined[combined["date"] <= str(as_of)]
+
+
 def morning_pipeline(
     as_of: date, cfg: dict, dry_run: bool = False
-) -> None:
-    """寄前発注指示を生成し通知する。休場日は通知抑止（FR-NOTIFY）。
-
-    Args:
-        as_of: 基準日。
-        cfg: 設定 dict。
-        dry_run: True の場合、DB 書込と発注指示送信を行わない。
-    """
+) -> pd.DataFrame:
+    """寄前発注指示を生成し通知する。戻り値は最終 orders。"""
     if not is_tse_business_day(as_of):
-        return
+        log.info("non-business day: %s", as_of)
+        return pd.DataFrame()
 
     run_id = uuid.uuid4().hex[:12]
-    storage = Storage(cfg["data"]["db_path"]) if not dry_run else None
+    storage: Storage | None = Storage(cfg["data"]["db_path"]) if not dry_run else None
     ds = make_datasource(cfg)
-    univ = load_universe(cfg["universe"]["file"])
+    univ = load_universe(cfg["universe"], as_of=str(as_of))
     codes = univ["code"].tolist()
     notifier = make_notifier(cfg)
 
-    # データ増分取得（過去約400日）
-    start = as_of - timedelta(days=400)
-    df = ds.fetch_daily(codes, start, as_of)
-    if df.empty:
-        notifier.send("本日はシグナル生成不可", "データ取得失敗")
-        return
+    try:
+        df = _fetch_prices_incremental(ds, storage, codes, as_of, dry_run=dry_run)
+        if df.empty:
+            notifier.send("本日はシグナル生成不可", "データ取得失敗")
+            return pd.DataFrame()
 
-    if not dry_run and storage is not None:
-        storage.upsert_prices(df)
+        df = df[df["date"] <= str(as_of)]
+        if df.empty:
+            notifier.send("本日はシグナル生成不可", "データ取得失敗(as_of超のみ)")
+            return pd.DataFrame()
 
-    prices = df  # メモリ上のデータをそのまま使用（dry-run では DB に依存しない）
-    model = MeanReversionRule(lookback=5, top_n=5)
-    sig = model.generate(prices, as_of=str(as_of))
-    if sig.empty:
-        notifier.send("本日はシグナル生成不可", "シグナル0件")
-        return
+        # shortability を DB から読み込み
+        shortability_df = pd.DataFrame()
+        if not dry_run and storage is not None:
+            shortability_df = storage.load_shortability(
+                codes,
+                start=str(as_of - timedelta(days=30)),
+                end=str(as_of),
+            )
 
-    if not dry_run and storage is not None:
-        storage.append_signals(
-            run_id=run_id,
-            signals=sig,
-            signal_asof_date=str(as_of),
-            model_name=type(model).__name__,
+        model = MeanReversionRule(
+            lookback=int(cfg.get("model", {}).get("lookback", 5)),
+            top_n=int(cfg.get("model", {}).get("top_n", 5)),
+        )
+        sig = model.generate(df, as_of=str(as_of))
+        if sig.empty:
+            notifier.send("本日はシグナル生成不可", "シグナル0件")
+            return pd.DataFrame()
+
+        if not dry_run and storage is not None:
+            storage.append_signals(
+                run_id=run_id,
+                signals=sig,
+                signal_asof_date=str(as_of),
+                model_name=type(model).__name__,
+            )
+
+        risk_cfg = risk_config_from_dict(cfg.get("risk", {}))
+        unit = int(cfg.get("sizing", {}).get("unit", 100))
+
+        orders = signals_to_orders(
+            sig,
+            df,
+            as_of=as_of,
+            sizing_cfg=cfg["sizing"],
+            risk_cfg=risk_cfg,
+            shortability=shortability_df if not shortability_df.empty else None,
+            universe=univ,
+            unit=unit,
+            order_type="MKT_OPEN",
+            for_backtest=False,
         )
 
-    # サイズ算定（前日終値・前日代金ベース）
-    prev = prices[prices["date"] < str(as_of)].sort_values("date")
-    last_row = prev.groupby("code").tail(1).set_index("code")
-    univ_idx = univ.set_index("code")
+        if orders.empty:
+            notifier.send("本日はシグナル生成不可", "サイズ算定・リスク制限後に0件")
+            return pd.DataFrame()
 
-    rows = []
-    for _, r in sig.iterrows():
-        code = r["code"]
-        if code not in last_row.index:
-            continue
-        ref = float(last_row.loc[code, "close"])
-        turnover = float(last_row.loc[code, "turnover"])
-        qty, yen, warn = compute_size(
-            turnover,
-            ref,
-            cfg["sizing"]["adv_ratio"],
-            cfg["sizing"]["adv_ratio_cap"],
-            unit=100,
-            market_open_unit_cap=cfg["sizing"]["market_open_unit_cap"],
-            is_market_open_order=True,
-        )
-        if qty == 0:
-            continue
-        name = univ_idx.loc[code, "name"] if code in univ_idx.index else ""
-        rows.append(
-            {
-                "code": code,
-                "name": name,
-                "side": r["side"],
-                "order_type": "MKT_OPEN",
-                "qty": qty,
-                "ref_price": ref,
-                "value_yen": yen,
-                "warn": warn,
-                "shortable": True,  # TODO: shortability 連携（MVP）
-            }
-        )
+        if not dry_run and storage is not None:
+            orders["order_date"] = str(as_of)
+            orders["signal_asof_date"] = str(as_of)
+            storage.append_orders(run_id, orders)
 
-    orders = pd.DataFrame(rows)
-    if orders.empty:
-        notifier.send("本日はシグナル生成不可", "サイズ算定後に0件")
-        return
+        if dry_run:
+            notifier.send(f"[DRY-RUN] 寄前発注指示 {as_of}", format_orders(orders))
+        else:
+            notifier.send(f"寄前発注指示 {as_of}", format_orders(orders))
 
-    if not dry_run and storage is not None:
-        orders["order_date"] = str(as_of)
-        orders["signal_asof_date"] = str(as_of)
-        storage.append_orders(run_id, orders)
+        return orders
 
-    if dry_run:
-        notifier.send(f"[DRY-RUN] 寄前発注指示 {as_of}", format_orders(orders))
-    else:
-        notifier.send(f"寄前発注指示 {as_of}", format_orders(orders))
-
-    if not dry_run and storage is not None:
-        storage.close()
+    finally:
+        if not dry_run and storage is not None:
+            storage.close()

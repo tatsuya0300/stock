@@ -55,3 +55,12 @@ def test_point_in_time_universe(tmp_path):
 
     assert df_2024["code"].tolist() == ["1111"]
     assert df_2025["code"].tolist() == ["2222"]
+
+
+def test_load_universe_accepts_cfg_dict(tmp_path):
+    p = tmp_path / "u.csv"
+    p.write_text("code,name\n7203,トヨタ\n", encoding="utf-8")
+    from jp_signal.universe import load_universe
+
+    df = load_universe({"file": str(p)})
+    assert list(df["code"]) == ["7203"]
