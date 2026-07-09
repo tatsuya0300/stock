@@ -2,6 +2,10 @@
 
 SignalModel インターフェースを介してルールベース/ML を差し替え可能にする。
 指数方向は予測せず、相対的な上位/下位を狙う設計。
+
+look-ahead 回避:
+  当日終値は as_of 時点で未確定のため使わない。
+  前営業日までの価格のみ使用する。
 """
 
 from __future__ import annotations
@@ -10,6 +14,14 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import pandas as pd
+
+
+def _previous_business_day(d) -> pd.Timestamp:
+    """d より前の直近営業日（簡易実装: 土日をスキップ）。"""
+    ts = pd.Timestamp(d)
+    while ts.weekday() >= 5:  # 土日
+        ts -= pd.Timedelta(days=1)
+    return ts
 
 
 class SignalModel(ABC):
@@ -22,15 +34,13 @@ class SignalModel(ABC):
 
 
 class MeanReversionRule(SignalModel):
-    """ルールベースの例（動作確認用ダミー）。
-
-    - lookback 日リターンの下位 top_n 銘柄 → BUY 候補
-    - lookback 日リターンの上位 top_n 銘柄 → SELL 候補
-    FR-MODEL-01 の「相対上位/下位」を満たすが収益性は担保しない。
-    実運用前に必ずバックテストで検証すること。
-    """
+    """ルールベースの例（動作確認用ダミー）。収益性は担保しない。"""
 
     def __init__(self, lookback: int = 5, top_n: int = 5):
+        if lookback < 1:
+            raise ValueError("lookback must be >= 1")
+        if top_n < 1:
+            raise ValueError("top_n must be >= 1")
         self.lookback = lookback
         self.top_n = top_n
 
@@ -39,17 +49,19 @@ class MeanReversionRule(SignalModel):
         if prices is None or prices.empty:
             return empty
 
-        df = prices[prices["date"] <= as_of].copy()
+        as_of_d = pd.Timestamp(as_of).date()
+        # 寄前想定: 当日終値は未確定のため使わない
+        cutoff = _previous_business_day(as_of_d).isoformat()
+
+        df = prices[prices["date"] <= cutoff].copy()
         if df.empty:
             return empty
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values(["code", "date"])
 
         # リターン計算は分割・配当調整済みの adj_close を使う。
-        # 旧スキーマ（adj_close 無し）でも動くよう close にフォールバック。
         price_col = "adj_close" if "adj_close" in df.columns else "close"
 
-        # 各銘柄について lookback 日リターンを算出
         rets: dict[str, float] = {}
         for code, g in df.groupby("code"):
             g = g.tail(self.lookback + 1)
@@ -57,24 +69,36 @@ class MeanReversionRule(SignalModel):
                 continue
             first = g[price_col].iloc[0]
             last = g[price_col].iloc[-1]
-            if first and first > 0:
-                rets[code] = (last / first) - 1.0
+            if first is not None and first > 0 and np.isfinite(first) and np.isfinite(last):
+                rets[str(code)] = (last / first) - 1.0
 
         if not rets:
             return empty
 
         ser = pd.Series(rets).sort_values()
-        n = min(self.top_n, len(ser) // 2 if len(ser) >= 2 else len(ser))
-        if n == 0:
-            n = min(self.top_n, len(ser))
+        n = min(self.top_n, max(1, len(ser) // 2))
 
         buys = ser.head(n)   # 最も下落 → 買い
         sells = ser.tail(n)  # 最も上昇 → 売り
 
-        rows = []
+        rows: list[dict] = []
         for code, r in buys.items():
-            rows.append({"code": code, "side": "BUY", "score": float(-r), "limit_price": np.nan})
+            rows.append(
+                {
+                    "code": code,
+                    "side": "BUY",
+                    "score": float(-r),
+                    "limit_price": np.nan,
+                }
+            )
         for code, r in sells.items():
-            rows.append({"code": code, "side": "SELL", "score": float(r), "limit_price": np.nan})
+            rows.append(
+                {
+                    "code": code,
+                    "side": "SELL",
+                    "score": float(r),
+                    "limit_price": np.nan,
+                }
+            )
 
         return pd.DataFrame(rows, columns=["code", "side", "score", "limit_price"])

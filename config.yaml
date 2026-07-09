@@ -1,21 +1,35 @@
 data:
   source: "yfinance"          # "yfinance" | "jquants"
   db_path: "./data/jp_signal.sqlite"
-  jquants_refresh_token: ""   # 本番のみ
+  jquants_refresh_token: ""   # 使わず環境変数 JQUANTS_REFRESH_TOKEN 推奨
+
 universe:
-  file: "./data/topix500.csv" # code,name の2列
+  file: "./data/topix500.csv" # 推奨: code,name,effective_from,effective_to
+
 backtest:
   start: "2022-01-01"
   end:   "2024-12-31"
-  impact_k_bp: 30.0           # sqrt則の較正係数
-  annual_interest_rate: 0.02  # 信用金利 年率2%
-  short_lending_rate:   0.02  # 貸株料 年率2%
+  impact_k_bp: 30.0
+  annual_interest_rate: 0.02
+  short_lending_rate: 0.02
+  adv_window: 20
+  holding_days: 1
+
 sizing:
-  adv_ratio: 0.001            # 前日代金0.1%
-  adv_ratio_cap: 0.002        # 上限0.2%
-  market_open_unit_cap: 50    # 寄成上限50単元
+  adv_ratio: 0.001
+  adv_ratio_cap: 0.002
+  market_open_unit_cap: 50
+
+risk:
+  max_orders_per_day: 10
+  max_gross_exposure_yen: 100000000
+  max_single_name_exposure_yen: 20000000
+  max_long_exposure_yen: 100000000
+  max_short_exposure_yen: 100000000
+  allow_short_without_confirmed_shortability: false
+
 notify:
-  channel: "console"          # "console" | "discord" | "slack"
-  discord_webhook: ""
+  channel: "console"          # "console" | "discord"
+  discord_webhook: ""         # または環境変数 DISCORD_WEBHOOK
   morning_time: "08:15"
   closing_time: "15:00"
