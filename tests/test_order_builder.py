@@ -1,6 +1,5 @@
 """order_builder tests."""
 
-
 import pandas as pd
 
 from jp_signal.order_builder import is_shortable_asof, signals_to_orders
@@ -33,20 +32,36 @@ def test_signals_to_orders_includes_name_for_live():
     prices = pd.DataFrame(
         [
             {
-                "code": "7203", "date": "2024-01-09",
-                "open": 100, "high": 110, "low": 90,
-                "close": 100, "adj_close": 100, "volume": 1e6, "turnover": 1e10,
+                "code": "7203",
+                "date": "2024-01-09",
+                "open": 100,
+                "high": 110,
+                "low": 90,
+                "close": 100,
+                "adj_close": 100,
+                "volume": 1e6,
+                "turnover": 1e10,
             },
             {
-                "code": "7203", "date": "2024-01-10",
-                "open": 100, "high": 110, "low": 90,
-                "close": 105, "adj_close": 105, "volume": 1e6, "turnover": 1e10,
+                "code": "7203",
+                "date": "2024-01-10",
+                "open": 100,
+                "high": 110,
+                "low": 90,
+                "close": 105,
+                "adj_close": 105,
+                "volume": 1e6,
+                "turnover": 1e10,
             },
         ]
     )
     sig = pd.DataFrame([{"code": "7203", "side": "BUY", "score": 1.0, "limit_price": None}])
     univ = pd.DataFrame([{"code": "7203", "name": "トヨタ"}])
-    risk = RiskConfig(allow_short_without_confirmed_shortability=True)
+    risk = RiskConfig(
+        allow_short_without_confirmed_shortability=True,
+        require_both_sides=False,
+        max_net_exposure_yen=50_000_000,
+    )
     orders = signals_to_orders(
         sig,
         prices,
@@ -69,20 +84,35 @@ def test_signals_to_orders_drops_unshortable_sell():
     prices = pd.DataFrame(
         [
             {
-                "code": "7203", "date": "2024-01-09",
-                "open": 100, "high": 110, "low": 90,
-                "close": 100, "adj_close": 100, "volume": 1e6, "turnover": 1e10,
+                "code": "7203",
+                "date": "2024-01-09",
+                "open": 100,
+                "high": 110,
+                "low": 90,
+                "close": 100,
+                "adj_close": 100,
+                "volume": 1e6,
+                "turnover": 1e10,
             },
             {
-                "code": "7203", "date": "2024-01-10",
-                "open": 100, "high": 110, "low": 90,
-                "close": 105, "adj_close": 105, "volume": 1e6, "turnover": 1e10,
+                "code": "7203",
+                "date": "2024-01-10",
+                "open": 100,
+                "high": 110,
+                "low": 90,
+                "close": 105,
+                "adj_close": 105,
+                "volume": 1e6,
+                "turnover": 1e10,
             },
         ]
     )
     # 営業日カレンダーに依存するため、as_of を平日に
     sig = pd.DataFrame([{"code": "7203", "side": "SELL", "score": 1.0, "limit_price": None}])
-    risk = RiskConfig(allow_short_without_confirmed_shortability=False)
+    risk = RiskConfig(
+        allow_short_without_confirmed_shortability=False,
+        require_both_sides=False,
+    )
     orders = signals_to_orders(
         sig,
         prices,

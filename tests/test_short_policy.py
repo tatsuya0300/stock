@@ -36,10 +36,8 @@ def _prices():
 
 
 def test_unconfirmed_short_dropped_by_default():
-    sig = pd.DataFrame(
-        [{"code": "7203", "side": "SELL", "score": 1.0, "limit_price": None}]
-    )
-    risk = RiskConfig(allow_short_without_confirmed_shortability=False)
+    sig = pd.DataFrame([{"code": "7203", "side": "SELL", "score": 1.0, "limit_price": None}])
+    risk = RiskConfig(allow_short_without_confirmed_shortability=False, require_both_sides=False)
     orders = signals_to_orders(
         sig,
         _prices(),
@@ -56,9 +54,7 @@ def test_unconfirmed_short_dropped_by_default():
 
 
 def test_confirmed_short_allowed():
-    sig = pd.DataFrame(
-        [{"code": "7203", "side": "SELL", "score": 1.0, "limit_price": None}]
-    )
+    sig = pd.DataFrame([{"code": "7203", "side": "SELL", "score": 1.0, "limit_price": None}])
     sh = pd.DataFrame(
         [
             {
@@ -69,7 +65,11 @@ def test_confirmed_short_allowed():
             }
         ]
     )
-    risk = RiskConfig(allow_short_without_confirmed_shortability=False)
+    risk = RiskConfig(
+        allow_short_without_confirmed_shortability=False,
+        require_both_sides=False,
+        max_net_exposure_yen=50_000_000,
+    )
     orders = signals_to_orders(
         sig,
         _prices(),
@@ -99,6 +99,9 @@ def test_risk_filter_drops_shortable_false():
             }
         ]
     )
-    risk = RiskConfig(allow_short_without_confirmed_shortability=False)
+    risk = RiskConfig(
+        allow_short_without_confirmed_shortability=False,
+        require_both_sides=False,
+    )
     out = apply_order_risk_limits(orders, risk)
     assert out.empty

@@ -100,8 +100,7 @@ def load_config(path: str = "config.yaml") -> dict:
     source = cfg.get("data", {}).get("source", "")
     if source not in valid_sources:
         raise ConfigError(
-            f"data.source は {valid_sources} のいずれかである必要があります "
-            f"(actual: {source!r})"
+            f"data.source は {valid_sources} のいずれかである必要があります (actual: {source!r})"
         )
 
     if source == "jquants":
@@ -147,9 +146,7 @@ def load_config(path: str = "config.yaml") -> dict:
     valid_channels = {"console", "discord"}
     channel = cfg.get("notify", {}).get("channel", "console")
     if channel not in valid_channels:
-        raise ConfigError(
-            f"notify.channel は {valid_channels} のいずれかである必要があります"
-        )
+        raise ConfigError(f"notify.channel は {valid_channels} のいずれかである必要があります")
 
     if channel == "discord":
         webhook = cfg.get("notify", {}).get("discord_webhook", "")
@@ -172,9 +169,7 @@ def load_config(path: str = "config.yaml") -> dict:
         )
 
     if not cfg["backtest"].get("impact_k_is_calibrated", False):
-        log.info(
-            "backtest.impact_k_is_calibrated=false: impact_k_bp は未較正です。"
-        )
+        log.info("backtest.impact_k_is_calibrated=false: impact_k_bp は未較正です。")
 
     return cfg
 
@@ -218,6 +213,5 @@ def enforce_short_policy_for_live(cfg: dict) -> None:
     """
     if cfg.get("risk", {}).get("allow_short_without_confirmed_shortability", False):
         log.warning(
-            "live short policy: 未確認売り許可中。"
-            " shortability.py 本実装前の本番運用は禁止。"
+            "live short policy: 未確認売り許可中。 shortability.py 本実装前の本番運用は禁止。"
         )
