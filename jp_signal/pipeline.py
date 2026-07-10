@@ -25,6 +25,7 @@ import pandas as pd
 
 from .calendar import is_tse_business_day
 from .config import enforce_short_policy_for_live, guard_approximate_turnover
+from .coverage import CoverageThresholds, validate_daily_coverage
 from .datasource import JQuantsSource, YFinanceSource
 from .model import MeanReversionRule
 from .notifier import ConsoleNotifier, DiscordNotifier, format_orders
@@ -179,6 +180,27 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
         if df.empty:
             notifier.send("本日はシグナル生成不可", "データ取得失敗(as_of超のみ)")
             return pd.DataFrame()
+
+        # coverage check
+        dq_cfg = cfg.get("data_quality", {})
+        thresholds = CoverageThresholds.from_config(dq_cfg)
+        coverage = validate_daily_coverage(
+            df,
+            univ,
+            as_of=as_of,
+            lookback=int(cfg.get("model", {}).get("lookback", 5)),
+            adv_window=int(cfg.get("backtest", {}).get("adv_window", 20)),
+            min_adv_periods=int(cfg.get("backtest", {}).get("min_adv_periods", 20)),
+            thresholds=thresholds,
+        )
+        if not coverage.ok:
+            log.warning(coverage.to_message())
+            if thresholds.hard_fail:
+                notifier.send(
+                    "本日はシグナル生成中止",
+                    f"coverage不足: {', '.join(coverage.failed_reasons)}",
+                )
+                return pd.DataFrame()
 
         # shortability を DB から読み込み
         shortability_df = pd.DataFrame()

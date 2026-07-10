@@ -39,6 +39,7 @@ _DEFAULT_DATA = {
 _DEFAULT_BACKTEST = {
     "impact_k_is_calibrated": False,
     "allow_unconfirmed_short_in_bt": False,
+    "min_adv_periods": 20,
 }
 
 
@@ -140,6 +141,23 @@ def load_config(path: str = "config.yaml") -> dict:
         raise ConfigError(
             f"sizing.adv_ratio ({adv_ratio}) が "
             f"sizing.adv_ratio_cap ({adv_ratio_cap}) を超えています"
+        )
+
+    # adv_window vs min_adv_periods バリデーション
+    bt_min_adv = int(sizing.get("min_adv_periods", 1))
+    bt_adv_win = int(sizing.get("adv_window", 20))
+    if bt_min_adv > bt_adv_win:
+        raise ConfigError(
+            f"sizing.min_adv_periods ({bt_min_adv}) が "
+            f"sizing.adv_window ({bt_adv_win}) を超えています"
+        )
+
+    bt_min_adv_bt = int(cfg.get("backtest", {}).get("min_adv_periods", 20))
+    bt_adv_win_bt = int(cfg.get("backtest", {}).get("adv_window", 20))
+    if bt_min_adv_bt > bt_adv_win_bt:
+        raise ConfigError(
+            f"backtest.min_adv_periods ({bt_min_adv_bt}) が "
+            f"backtest.adv_window ({bt_adv_win_bt}) を超えています"
         )
 
     # notify.channel のバリデーション

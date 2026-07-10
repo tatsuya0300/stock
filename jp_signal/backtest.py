@@ -17,6 +17,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .adv import stock_adv_before
+
 _REQUIRED_SIGNAL_COLS = {
     "code",
     "date",
@@ -39,9 +41,14 @@ class Backtester:
         half_spread_bp: float = 0.0,
         require_liquidity_data: bool = True,
         adv_window: int = 20,
+        min_adv_periods: int = 1,
         zero_carry_for_intraday: bool = True,
         require_confirmed_shortability: bool = True,
     ):
+        if min_adv_periods > adv_window:
+            raise ValueError(
+                f"min_adv_periods ({min_adv_periods}) must be <= adv_window ({adv_window})"
+            )
         self.k = float(impact_k_bp)
         self.annual_int = float(annual_interest_rate)
         self.annual_lend = float(annual_lending_rate)
@@ -51,6 +58,7 @@ class Backtester:
         self.half_spread_bp = float(half_spread_bp)
         self.require_liquidity_data = bool(require_liquidity_data)
         self.adv_window = max(1, int(adv_window))
+        self.min_adv_periods = max(1, int(min_adv_periods))
         self.zero_carry_for_intraday = bool(zero_carry_for_intraday)
         self.require_confirmed_shortability = bool(require_confirmed_shortability)
 
@@ -112,14 +120,16 @@ class Backtester:
 
     # --------------------------------------------------------------- helpers
     def _prev_adv(self, px: pd.DataFrame, code: str, d) -> float:
-        try:
-            g = px.loc[code]
-        except KeyError:
-            return 0.0
-        prev = g.loc[g.index < d]
-        if prev.empty:
-            return 0.0
-        return float(prev.tail(self.adv_window)["turnover"].mean())
+        # Reconstruct flat DataFrame from multi-index for shared ADV function
+        px_flat = px.reset_index()
+        return stock_adv_before(
+            px_flat,
+            d,
+            code,
+            window=self.adv_window,
+            min_periods=self.min_adv_periods,
+            strictly_before=True,
+        )
 
     def _get_future_row(self, px: pd.DataFrame, code: str, d, holding_days: int):
         try:
