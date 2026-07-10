@@ -50,12 +50,17 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="DB 書込をスキップ",
     )
+    p.add_argument(
+        "--config",
+        default="config.yaml",
+        help="設定ファイルパス",
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    cfg = load_config()
+    cfg = load_config(args.config)
     notifier = make_notifier(cfg)
     as_of = date.fromisoformat(args.date) if args.date else date.today()
 

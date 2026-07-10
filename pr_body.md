@@ -1,20 +1,48 @@
-## P0対応 変更サマリ
+## Summary
 
-| 項目 | 内容 |
-|---|---|
-| README | 現行ツリー・起動・ユニバース取得・運用ルール・弱点を同期 |
-| デフォルトユニバース | topix500_sample.csv |
-| CI | .github/workflows/ci.yml 正式配置 |
-| yfinanceガード | guard_approximate_turnover() で sizing/impact hard fail |
-| shortability | デフォルト未確認売り禁止を設定・BT・テストで固定化 |
+バックテストと運用パイプラインの最低限の正確性・再現性を改善しました。
 
-### 変更ファイル一覧
+## Changes
 
-1. config.yaml -- デフォルトを topix500_sample.csv に変更。allow_approximate_turnover: false を明示。shortability 未確認売り禁止をデフォルト化。
-2. jp_signal/config.py -- guard_approximate_turnover, enforce_short_policy_for_live, uses_approximate_turnover を追加。環境変数による秘密情報上書き、各種バリデーション追加。
-3. jp_signal/pipeline.py -- morning_pipeline に yfinance 近似ガードと shortpolicy 警告を追加。
-4. scripts/run_backtest.py -- yfinance 近似ガード追加。shortability 未確認売りは BT でもデフォルト除外。
-5. .github/workflows/ci.yml -- 新規作成。ruff + mypy + pytest を push/PR 時に実行。
-6. README.md -- 現行ディレクトリ構成、起動手順、ユニバース取得手順、運用ルール、弱点を同期。
-7. tests/test_config.py -- 各種バリデーションのテスト追加。
-8. tests/test_short_policy.py -- 新規。未確認売り除外と確認済み売り許可のテスト。
+- GitHub Actions CIを実体化
+- `main.py` と `scripts/run_backtest.py` に `--config` を追加
+- demo / production 設定を分離
+- BTで `allow_unconfirmed_short_in_bt` が実際に効くように修正
+- サイジングを前日売買代金ではなく rolling ADV ベースに変更
+- `run_backtest.py` の不要な `all_dates[20:]` を削除
+- shortability policy と rolling ADV の回帰テストを追加
+
+## Motivation
+
+現状では以下の問題がありました。
+
+- README上はCIがあるが、実際には `.github/workflows/ci.yml` が存在しない
+- デフォルト設定のままでは `python main.py --dry-run` がhard failする
+- `allow_unconfirmed_short_in_bt=true` でも Backtester 側でSELLが除外される
+- サイジングにADVではなく前日単日のturnoverを使っていた
+- warm-up期間を確保しているにもかかわらず、BT開始後さらに20営業日を捨てていた
+
+## Scope
+
+このPRは最小修正です。以下は別PR対象です。
+
+- portfolio-level backtester
+- cash / position / NAV ledger
+- corporate action対応
+- shortability ETL本実装
+- DB migration framework
+- fills重複防止
+
+## Test
+
+```bash
+ruff check .
+mypy jp_signal --ignore-missing-imports
+pytest -q
+```
+
+## Notes
+
+- `configs/demo.yaml` は疎通確認用です
+- 本番・本格BTでは `configs/production.yaml` と J-Quants を使用してください
+- 本PRの対象ブランチは `fix/backtest-ci-adv-short-policy` です
