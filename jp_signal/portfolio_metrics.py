@@ -23,15 +23,20 @@ def summarize_portfolio_ledger(
     if len(nav) < 2:
         return {"error": f"ledger too short: {len(nav)} rows"}
 
+    # 初日リターンをinitial_capitalから計算して含める
+    first_nav = float(nav.iloc[0])
+    first_return = first_nav / initial_capital - 1.0
+
     daily_returns = nav.pct_change().dropna()
+    # 初日リターンを先頭に追加
+    daily_returns = pd.concat(
+        [pd.Series([first_return], index=[nav.index[0]]), daily_returns]
+    )
 
     mean_return = float(daily_returns.mean())
-    std_return = float(daily_returns.std())
+    std_return = float(daily_returns.std(ddof=1) if len(daily_returns) > 1 else 0.0)
 
     trading_days_per_year = 252.0
-    annual_factor = (
-        np.sqrt(trading_days_per_year) if std_return > 0 else 0.0
-    )
 
     daily_rf = (
         (1.0 + risk_free_rate) ** (1.0 / trading_days_per_year) - 1.0
@@ -39,7 +44,7 @@ def summarize_portfolio_ledger(
 
     if std_return > 0:
         sharpe = float(
-            (mean_return - daily_rf) / std_return * annual_factor
+            (mean_return - daily_rf) / std_return * np.sqrt(trading_days_per_year)
         )
     else:
         sharpe = 0.0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from jp_signal.portfolio_metrics import summarize_portfolio_ledger
 
@@ -47,3 +48,31 @@ def test_summarize_positive_return():
     assert result["sharpe"] > 0
     assert result["max_drawdown_pct"] >= -0.01
     assert result["max_gross_exposure"] == 500_000
+
+
+def test_first_day_return_is_included():
+    ledger = pd.DataFrame(
+        [
+            {
+                "nav": 990_000,
+                "gross_exposure": 500_000,
+                "net_exposure": 0,
+            },
+            {
+                "nav": 990_000,
+                "gross_exposure": 0,
+                "net_exposure": 0,
+            },
+        ]
+    )
+
+    result = summarize_portfolio_ledger(
+        ledger,
+        initial_capital=1_000_000,
+    )
+
+    daily_returns = result["daily_returns"]
+
+    assert len(daily_returns) == 2
+    assert daily_returns.iloc[0] == pytest.approx(-0.01)
+    assert daily_returns.iloc[1] == pytest.approx(0.0)

@@ -18,9 +18,10 @@ backtest:
   annual_interest_rate: 0.02
   short_lending_rate: 0.02
   adv_window: 20
+  min_adv_periods: 20
   holding_days: 1
-  commission_bp: 0.0
-  half_spread_bp: 0.0
+  commission_bp: 1.0
+  half_spread_bp: 5.0
   output_dir: "./data/bt_out"
   allow_unconfirmed_short_in_bt: false
   initial_capital: 100000000

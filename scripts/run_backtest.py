@@ -171,6 +171,9 @@ def main() -> None:
             commission_bp=float(cfg["backtest"].get("commission_bp", 0.0)),
             half_spread_bp=float(cfg["backtest"].get("half_spread_bp", 0.0)),
             adv_window=int(cfg["backtest"].get("adv_window", 20)),
+            min_adv_periods=int(
+                cfg["backtest"].get("min_adv_periods", 20)
+            ),
             require_liquidity_data=True,
             zero_carry_for_intraday=True,
             require_confirmed_shortability=require_confirmed_shortability,
