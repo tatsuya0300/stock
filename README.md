@@ -205,6 +205,42 @@ export DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
 - corporate action、配当、追証、強制決済、部分約定は未実装。
 - production設定のcommission/spread/impactは暫定値であり、実fillsによる較正が必要。
 
+## 研究評価
+
+PortfolioBacktesterの出力から、研究用評価レポートを生成できます。
+
+```bash
+python scripts/run_portfolio_backtest.py
+
+python scripts/run_research_report.py \
+  --ledger data/bt_out/daily_ledger.csv \
+  --trades data/bt_out/portfolio_trades.csv
+```
+
+TOPIX等のベンチマーク日次リターンを使用する場合：
+
+```bash
+python scripts/run_research_report.py \
+  --benchmark data/topix_total_return.csv
+```
+
+benchmark CSV:
+
+```csv
+date,return
+2024-01-04,0.0012
+2024-01-05,-0.0031
+```
+
+### 注意
+
+- benchmarkは価格指数より配当込み指数を優先する。
+- sector分類はpoint-in-timeデータを使用する。
+- parameter選択はwalk-forwardのtrain期間だけで行う。
+- test期間の成績を見てparameterを変更しない。
+- 複数parameterを試した場合、未補正のp値や最大Sharpeを採用しない。
+- impact係数は実fillsのtrain期間だけで較正する。
+
 ## 開発
 
 ```bash
