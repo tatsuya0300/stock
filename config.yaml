@@ -29,8 +29,12 @@ backtest:
   short_lending_rate: 0.02
   adv_window: 20
   holding_days: 1
-  commission_bp: 0.0
-  half_spread_bp: 0.0
+  min_adv_periods: 20
+
+  # Phase1: 楽観的すぎる0コストを避ける。
+  # 実運用・実fills取得後に較正すること。
+  commission_bp: 1.0
+  half_spread_bp: 5.0
   output_dir: "./data/bt_out"
   # true のとき shortability 未確認の売りを BT でも許可（開発専用）
   allow_unconfirmed_short_in_bt: false
@@ -38,6 +42,10 @@ backtest:
 sizing:
   adv_ratio: 0.001
   adv_ratio_cap: 0.002
+  adv_window: 20
+  min_adv_periods: 20
+  require_full_adv_history: true
+  allow_single_day_turnover_fallback: false
   market_open_unit_cap: 50
   unit: 100
 
@@ -56,6 +64,12 @@ risk:
 
   # 本番デフォルト: false（shortability 未確認の売りを出さない）
   allow_short_without_confirmed_shortability: false
+
+data_quality:
+  price_coverage_min: 0.99
+  lookback_coverage_min: 0.95
+  turnover_coverage_min: 0.99
+  hard_fail: true
 
 notify:
   channel: "console"          # "console" | "discord"

@@ -10,12 +10,23 @@ schema v3:
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
 import pandas as pd
 
 SCHEMA_VERSION = 3
+
+
+def _sha256_file(path: str | Path) -> str:
+    """ファイルのSHA256を計算する。"""
+    p = Path(path)
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 PRICE_COLS = [
     "code",
@@ -100,7 +111,10 @@ CREATE TABLE IF NOT EXISTS fills (
     qty INTEGER,
     price REAL,
     note TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    source_file_hash TEXT,
+    source_row_number INTEGER,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_file_hash, source_row_number)
 );
 """
 
@@ -441,6 +455,8 @@ class Storage:
             "qty",
             "price",
             "note",
+            "source_file_hash",
+            "source_row_number",
             "created_at",
         ]
         if trade_date:
@@ -463,14 +479,20 @@ class Storage:
         return pd.read_sql(q, self.conn)
 
     def import_fills_csv(self, path: str | Path) -> int:
-        """CSV から fills を一括取込。戻り値は取込件数。
+        """CSV から fills を一括取込。戻り値は新規取込件数。
 
         必須列: trade_date, code, side, qty, price
         任意列: note, run_id
+
+        重複防止:
+          source_file_hash + source_row_number を一意キーにする。
+          同じCSVを再インポートしても二重計上しない。
         """
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"fills CSV が見つかりません: {path}")
+
+        file_hash = _sha256_file(p)
 
         df = pd.read_csv(p, dtype={"code": str})
         required = {"trade_date", "code", "side", "qty", "price"}
@@ -484,13 +506,19 @@ class Storage:
             df["run_id"] = None
 
         n = 0
+        sql = """
+        INSERT INTO fills (
+            run_id, trade_date, code, side, qty, price, note,
+            source_file_hash, source_row_number
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_file_hash, source_row_number) DO NOTHING
+        """
+
         with self.conn:
-            for _, r in df.iterrows():
-                self.conn.execute(
-                    """
-                    INSERT INTO fills (run_id, trade_date, code, side, qty, price, note)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
+            for row_number, (_, r) in enumerate(df.iterrows(), start=2):
+                cur = self.conn.execute(
+                    sql,
                     (
                         None if pd.isna(r["run_id"]) else str(r["run_id"]),
                         str(pd.to_datetime(r["trade_date"]).date()),
@@ -499,9 +527,12 @@ class Storage:
                         int(r["qty"]),
                         float(r["price"]),
                         "" if pd.isna(r["note"]) else str(r["note"]),
+                        file_hash,
+                        row_number,
                     ),
                 )
-                n += 1
+                n += int(cur.rowcount)
+
         return n
 
     def close(self) -> None:

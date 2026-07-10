@@ -11,6 +11,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from .adv import rolling_adv_before
 from .calendar import previous_business_day
 from .risk import RiskConfig, apply_order_risk_limits
 from .sizing import compute_size
@@ -53,43 +54,6 @@ def _ref_rows_before(prices: pd.DataFrame, as_of: date | str) -> pd.DataFrame:
     if prev.empty:
         return pd.DataFrame()
     return prev.groupby("code").tail(1).set_index("code")
-
-
-def _rolling_adv_before(
-    prices: pd.DataFrame,
-    as_of: date | str,
-    *,
-    window: int,
-    min_periods: int,
-) -> pd.Series:
-    """as_of寄前時点で利用可能なrolling ADVを返す。
-
-    注意:
-      - as_of当日データは使わない
-      - previous_business_day(as_of) 以前のみを使う
-      - turnover欠損・非数値は除外
-    """
-    if prices is None or prices.empty:
-        return pd.Series(dtype=float)
-
-    as_of_d = pd.Timestamp(as_of).date()
-    cutoff = pd.Timestamp(previous_business_day(as_of_d))
-
-    x = prices.copy()
-    x["date"] = pd.to_datetime(x["date"])
-    x["turnover"] = pd.to_numeric(x["turnover"], errors="coerce")
-    x = x[x["date"] <= cutoff]
-
-    if x.empty:
-        return pd.Series(dtype=float)
-
-    def _adv(ser: pd.Series) -> float:
-        tail = ser.dropna().tail(window)
-        if len(tail) < min_periods:
-            return float("nan")
-        return float(tail.mean())
-
-    return x.groupby("code")["turnover"].apply(_adv).astype(float)
 
 
 
@@ -135,6 +99,21 @@ def signals_to_orders(
     if last_row.empty:
         return pd.DataFrame(columns=empty_cols)
 
+    adv_window = int(sizing_cfg.get("adv_window", 20))
+    min_adv_periods = int(sizing_cfg.get("min_adv_periods", 1))
+    require_full_adv_history = bool(sizing_cfg.get("require_full_adv_history", False))
+    allow_single_day_turnover_fallback = bool(
+        sizing_cfg.get("allow_single_day_turnover_fallback", True)
+    )
+
+    adv_series = rolling_adv_before(
+        prices,
+        as_of,
+        window=adv_window,
+        min_periods=min_adv_periods,
+        strictly_before=True,
+    )
+
     univ_idx = None
     if universe is not None and not universe.empty:
         univ_idx = universe.set_index("code")
@@ -148,15 +127,13 @@ def signals_to_orders(
             continue
 
         ref = float(last_row.loc[code, "close"])
-        adv_series = _rolling_adv_before(
-            prices,
-            as_of,
-            window=int(sizing_cfg.get("adv_window", 20)),
-            min_periods=int(sizing_cfg.get("min_adv_periods", 20)),
-        )
         adv = float(adv_series.get(code, float("nan")))
+
         if not np.isfinite(adv) or adv <= 0:
-            adv = float(last_row.loc[code, "turnover"])
+            if require_full_adv_history:
+                continue
+            if allow_single_day_turnover_fallback:
+                adv = float(last_row.loc[code, "turnover"])
         qty, yen, warn = compute_size(
             adv,
             ref,
