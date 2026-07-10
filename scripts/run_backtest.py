@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import timedelta
 
 import pandas as pd
 
@@ -42,12 +43,37 @@ def main() -> None:
         univ_all = load_universe(cfg["universe"])
         codes = univ_all["code"].tolist()
 
+        bt_start = pd.Timestamp(cfg["backtest"]["start"]).date()
+
+        bt_end = pd.Timestamp(cfg["backtest"]["end"]).date()
+
+        model_lookback = int(cfg.get("model", {}).get("lookback", 5))
+
+        adv_window = int(cfg["backtest"].get("adv_window", 20))
+
+        # 営業日数より十分長い暦日バッファ
+        warmup_calendar_days = (
+            max(
+                model_lookback,
+                adv_window,
+            )
+            * 3
+        )
+
+        load_start = bt_start - timedelta(days=warmup_calendar_days)
+
         prices = st.load_prices(
-            codes, cfg["backtest"]["start"], cfg["backtest"]["end"]
+            codes,
+            load_start.isoformat(),
+            bt_end.isoformat(),
         )
+
         short = st.load_shortability(
-            codes, cfg["backtest"]["start"], cfg["backtest"]["end"]
+            codes,
+            load_start.isoformat(),
+            bt_end.isoformat(),
         )
+
         if prices.empty:
             print("価格データが空です。先に main.py 等で DB へ取り込んでください。")
             return
@@ -79,7 +105,11 @@ def main() -> None:
         else:
             risk_cfg.allow_short_without_confirmed_shortability = False
 
-        all_dates = sorted(prices["date"].unique())
+        all_dates = sorted(
+            d
+            for d in prices["date"].unique()
+            if cfg["backtest"]["start"] <= d <= cfg["backtest"]["end"]
+        )
 
         signal_frames: list[pd.DataFrame] = []
         for d in all_dates[20:]:
@@ -137,16 +167,24 @@ def main() -> None:
             print("バックテスト結果が空です。")
             return
 
-        summary = summarize_backtest(result)
+        summary = summarize_backtest(
+            result,
+            initial_capital=float(cfg["backtest"].get("initial_capital", 100_000_000)),
+            risk_free_rate=float(cfg["backtest"].get("risk_free_rate", 0.0)),
+            trading_dates=all_dates,
+        )
         print(f"全シグナル: {summary['n_signals']}")
         print(f"約定: {summary['n_filled']}")
         print(f"約定率: {summary['fill_rate'] * 100:.1f}%")
-        print(f"合計PnL: {summary['total_pnl']:.0f}")
+        print(f"合計PnL: {summary['total_pnl']:,.0f}円")
+        print(f"総リターン: {summary['total_return'] * 100:.2f}%")
         print(f"勝率: {summary['win_rate'] * 100:.1f}%")
-        print(f"日次PnL平均  : {summary['daily_pnl_mean']:.0f}")
-        print(f"日次PnL標準偏差: {summary['daily_pnl_std']:.0f}")
-        print(f"Sharpe-like: {summary['sharpe_like']:.2f}")
-        print(f"MaxDD(PnL): {summary['max_drawdown_pnl']:.0f}")
+        print(f"Sharpe: {summary['sharpe']:.2f}")
+        print(
+            "最大DD: "
+            f"{summary['max_drawdown_yen']:,.0f}円 "
+            f"({summary['max_drawdown_pct'] * 100:.2f}%)"
+        )
         print(f"status: {summary['status_counts']}")
 
         # 成果物
