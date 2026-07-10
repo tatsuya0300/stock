@@ -40,6 +40,7 @@ def test_drops_unconfirmed_short():
         max_single_name_exposure_yen=10_000_000,
         max_long_exposure_yen=10_000_000,
         max_short_exposure_yen=10_000_000,
+        require_both_sides=False,
         allow_short_without_confirmed_shortability=False,
     )
 
@@ -55,6 +56,7 @@ def test_single_name_limit():
         max_single_name_exposure_yen=500_000,
         max_long_exposure_yen=10_000_000,
         max_short_exposure_yen=10_000_000,
+        require_both_sides=False,
     )
 
     out = apply_order_risk_limits(_orders(), risk)
@@ -69,6 +71,7 @@ def test_max_orders_per_day():
         max_single_name_exposure_yen=10_000_000,
         max_long_exposure_yen=10_000_000,
         max_short_exposure_yen=10_000_000,
+        require_both_sides=False,
     )
 
     out = apply_order_risk_limits(_orders(), risk)

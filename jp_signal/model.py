@@ -68,14 +68,27 @@ class MeanReversionRule(SignalModel):
             if first is not None and first > 0 and np.isfinite(first) and np.isfinite(last):
                 rets[str(code)] = (last / first) - 1.0
 
-        if not rets:
+        if len(rets) < 2:
             return empty
 
-        ser = pd.Series(rets).sort_values()
-        n = min(self.top_n, max(1, len(ser) // 2))
+        ser = pd.Series(rets, dtype=float).dropna().sort_values()
 
-        buys = ser.head(n)   # 最も下落 → 買い
-        sells = ser.tail(n)  # 最も上昇 → 売り
+        # BUY/SELLが重複しない最大数
+        n = min(
+            self.top_n,
+            len(ser) // 2,
+        )
+
+        if n < 1:
+            return empty
+
+        buys = ser.iloc[:n]
+        sells = ser.iloc[-n:]
+
+        # 防御的チェック
+        overlap = set(buys.index) & set(sells.index)
+        if overlap:
+            raise RuntimeError(f"BUY/SELL overlap detected: {sorted(overlap)}")
 
         rows: list[dict] = []
         for code, r in buys.items():

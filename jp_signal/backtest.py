@@ -64,15 +64,43 @@ class Backtester:
         return day_high > limit
 
     # -------------------------------------------------------- market impact
-    def market_impact_bp(self, order_value: float, adv: float) -> float:
-        if adv is None or adv <= 0 or order_value <= 0:
-            return 0.0
-        return self.k * float(np.sqrt(order_value / adv))
+    @staticmethod
+    def _is_valid_adv(adv: float | None) -> bool:
+        if adv is None:
+            return False
+        try:
+            value = float(adv)
+        except (TypeError, ValueError):
+            return False
+        return bool(np.isfinite(value) and value > 0)
 
-    def _slippage_components(self, order_value: float, adv: float) -> tuple[float, float, float, float]:
-        """(impact_bp, half_spread_bp, commission_bp, total_bp)"""
-        impact = self.market_impact_bp(order_value, adv)
-        return impact, self.half_spread_bp, self.commission_bp, impact + self.half_spread_bp + self.commission_bp
+    def market_impact_bp(self, order_value: float, adv: float) -> float:
+        if not np.isfinite(order_value) or order_value <= 0:
+            raise ValueError(f"invalid order_value: {order_value}")
+
+        if not self._is_valid_adv(adv):
+            raise ValueError(f"invalid ADV: {adv}")
+
+        participation = order_value / float(adv)
+        return self.k * float(np.sqrt(participation))
+
+    def _slippage_components(
+        self, order_value: float, adv: float
+    ) -> tuple[float, float, float, float]:
+        """(impact_bp, half_spread_bp, commission_bp, total_bp)
+
+        ADV が無効でも spread/commission は適用する。
+        """
+        if self._is_valid_adv(adv):
+            impact = self.market_impact_bp(order_value, adv)
+        else:
+            impact = 0.0
+        return (
+            impact,
+            self.half_spread_bp,
+            self.commission_bp,
+            impact + self.half_spread_bp + self.commission_bp,
+        )
 
     def _apply_slippage(
         self, price: float, order_value: float, adv: float, direction: int
@@ -103,9 +131,7 @@ class Backtester:
         exit_date = fut.index[holding_days - 1]
         return exit_row, exit_date
 
-    def _latest_shortability_before(
-        self, sh: pd.DataFrame, code: str, d
-    ) -> dict | None:
+    def _latest_shortability_before(self, sh: pd.DataFrame, code: str, d) -> dict | None:
         try:
             g = sh.loc[code]
         except KeyError:
@@ -115,30 +141,63 @@ class Backtester:
             return None
         return dict(prev.iloc[-1])
 
-    def _entry_price(self, row, sig, adv: float, side_sign: int):
-        order_type = sig.get("order_type", "MKT_OPEN")
-        qty = sig.get("qty", 0)
+    def _entry_price(
+        self,
+        row: pd.Series,
+        sig: dict,
+        adv: float,
+        side_sign: int,
+    ) -> tuple[float | None, float]:
+        order_type = str(sig.get("order_type", "MKT_OPEN")).upper()
+        qty = int(sig.get("qty", 0))
+
+        limit_price: float | None = None
 
         if order_type == "LIMIT":
-            lp = sig.get("limit_price", np.nan)
-            if lp is None or (isinstance(lp, float) and np.isnan(lp)):
-                return None, 0.0
-            if side_sign > 0:
-                if not self._fills_limit_buy(row["low"], lp):
-                    return None, 0.0
-                base = min(lp, row["open"])
-            else:
-                if not self._fills_limit_sell(row["high"], lp):
-                    return None, 0.0
-                base = max(lp, row["open"])
-        elif order_type == "MKT_CLOSE":
-            base = row["close"]
-        else:
-            base = row["open"]
+            raw_limit = sig.get("limit_price")
 
-        order_value = float(base) * float(qty)
-        px, slip_bp = self._apply_slippage(float(base), order_value, adv, direction=side_sign)
-        return px, slip_bp
+            try:
+                limit_price = float(raw_limit)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None, 0.0
+
+            if not np.isfinite(limit_price) or limit_price <= 0:
+                return None, 0.0
+
+            if side_sign > 0:
+                if not self._fills_limit_buy(float(row["low"]), limit_price):
+                    return None, 0.0
+                base = min(limit_price, float(pd.to_numeric(row["open"])))
+            else:
+                if not self._fills_limit_sell(float(row["high"]), limit_price):
+                    return None, 0.0
+                base = max(limit_price, float(pd.to_numeric(row["open"])))
+
+        elif order_type == "MKT_CLOSE":
+            base = float(pd.to_numeric(row["close"]))
+
+        elif order_type == "MKT_OPEN":
+            base = float(pd.to_numeric(row["open"]))
+
+        else:
+            return None, 0.0
+
+        order_value = float(pd.to_numeric(base)) * float(qty)
+        execution_price, slip_bp = self._apply_slippage(
+            base,
+            order_value,
+            adv,
+            direction=side_sign,
+        )
+
+        # 指値より不利な価格では約定させない。
+        if limit_price is not None:
+            if side_sign > 0 and execution_price > limit_price:
+                return None, 0.0
+            if side_sign < 0 and execution_price < limit_price:
+                return None, 0.0
+
+        return execution_price, slip_bp
 
     def run(
         self,
@@ -171,7 +230,7 @@ class Backtester:
             d = pd.to_datetime(s["date"])
 
             if s["side"] not in _VALID_SIDES:
-                results.append({**base, "status": "INVALID_SIDE"})
+                results.append({**base, "entry_date": str(d.date()), "status": "INVALID_SIDE"})
                 continue
 
             try:
@@ -179,78 +238,133 @@ class Backtester:
             except (TypeError, ValueError):
                 qty = 0
             if qty <= 0:
-                results.append({**base, "status": "INVALID_QTY"})
+                results.append({**base, "entry_date": str(d.date()), "status": "INVALID_QTY"})
                 continue
 
             if (code, d) not in px.index:
-                results.append({**base, "status": "NO_PRICE_DATA"})
+                results.append({**base, "entry_date": str(d.date()), "status": "NO_PRICE_DATA"})
                 continue
 
             row = px.loc[(code, d)]
             adv = self._prev_adv(px, code, d)
 
-            if self.require_liquidity_data and adv <= 0:
-                results.append({**base, "status": "NO_ENTRY_LIQUIDITY_DATA"})
+            if self.require_liquidity_data and not self._is_valid_adv(adv):
+                results.append(
+                    {
+                        **base,
+                        "entry_date": str(d.date()),
+                        "status": "NO_ENTRY_LIQUIDITY_DATA",
+                    }
+                )
                 continue
 
             # FR-BT-05: 売り可否チェック
             if s["side"] == "SELL":
-                snap = (
-                    self._latest_shortability_before(sh, code, d)
-                    if sh is not None
-                    else None
-                )
+                snap = self._latest_shortability_before(sh, code, d) if sh is not None else None
                 shortable = (
                     snap is not None
                     and int(snap["is_margin_lendable"]) == 1
                     and int(snap["short_restricted"]) == 0
                 )
                 if not shortable:
-                    results.append({**base, "status": "SKIP_NOT_SHORTABLE"})
+                    results.append(
+                        {**base, "entry_date": str(d.date()), "status": "SKIP_NOT_SHORTABLE"}
+                    )
                     continue
 
             side_sign = 1 if s["side"] == "BUY" else -1
             entry, slip_entry_bp = self._entry_price(row, s, adv, side_sign)
             if entry is None:
-                results.append({**base, "status": "NO_FILL"})
+                results.append({**base, "entry_date": str(d.date()), "status": "NO_FILL"})
                 continue
 
-            holding_days = int(s.get("holding_days", 1))
-            exit_row, exit_date = self._get_future_row(px, code, d, holding_days)
-            if exit_row is None:
-                results.append({**base, "status": "NO_EXIT_DATA"})
+            try:
+                holding_days = int(s.get("holding_days", 1))
+            except (TypeError, ValueError):
+                holding_days = 0
+
+            if holding_days < 1:
+                results.append(
+                    {
+                        **base,
+                        "entry_date": str(d.date()),
+                        "status": "INVALID_HOLDING_DAYS",
+                    }
+                )
+                continue
+
+            exit_row, exit_date = self._get_future_row(
+                px,
+                code,
+                d,
+                holding_days,
+            )
+
+            if exit_row is None or exit_date is None:
+                results.append(
+                    {
+                        **base,
+                        "entry_date": str(d.date()),
+                        "status": "NO_EXIT_DATA",
+                    }
+                )
+                continue
+
+            exit_adv = self._prev_adv(px, code, exit_date)
+
+            if self.require_liquidity_data and not self._is_valid_adv(exit_adv):
+                results.append(
+                    {
+                        **base,
+                        "entry_date": str(d.date()),
+                        "exit_date": str(pd.Timestamp(exit_date).date()),
+                        "status": "NO_EXIT_LIQUIDITY_DATA",
+                    }
+                )
                 continue
 
             exit_base = float(exit_row["close"])
-            exit_adv = self._prev_adv(px, code, exit_date)
+            exit_order_value = exit_base * qty
+
             exit_price, slip_exit_bp = self._apply_slippage(
-                exit_base, exit_base * qty, exit_adv, direction=-side_sign
+                exit_base,
+                exit_order_value,
+                exit_adv,
+                direction=-side_sign,
             )
 
-            # FR-BT-06: carry cost
-            if self.zero_carry_for_intraday and holding_days <= 1:
-                cal_days = 0
-                carry_cost = 0.0
+            # 翌営業日決済はintradayではない。
+            cal_days = max(
+                (pd.Timestamp(exit_date) - pd.Timestamp(d)).days,
+                0,
+            )
+
+            if self.zero_carry_for_intraday and cal_days == 0:
+                carry_cost_per_share = 0.0
             else:
-                cal_days = (exit_date - d).days
-                cal_days = max(cal_days, 1)
                 carry_rate = self.daily_lend if s["side"] == "SELL" else self.daily_int
-                carry_cost = entry * carry_rate * cal_days
+                carry_cost_per_share = entry * carry_rate * cal_days
 
             direction = side_sign
-            gross = (exit_price - entry) * direction * qty
-            pnl = gross - carry_cost * qty
+            gross_pnl = (exit_price - entry) * direction * qty
+            carry_cost = carry_cost_per_share * qty
+            pnl = gross_pnl - carry_cost
 
             results.append(
                 {
                     **base,
+                    "entry_date": str(pd.Timestamp(d).date()),
+                    "exit_date": str(pd.Timestamp(exit_date).date()),
                     "entry": entry,
                     "exit": exit_price,
-                    "carry_cost_per_share": carry_cost,
+                    "entry_adv": adv,
+                    "exit_adv": exit_adv,
+                    "carry_cost_per_share": carry_cost_per_share,
+                    "carry_cost": carry_cost,
                     "carry_days": cal_days,
                     "slippage_entry_bp": slip_entry_bp,
                     "slippage_exit_bp": slip_exit_bp,
-                    "gross_pnl": gross,
+                    "gross_pnl": gross_pnl,
                     "pnl": pnl,
                     "status": "FILLED",
                 }

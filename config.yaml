@@ -45,8 +45,15 @@ risk:
   max_orders_per_day: 10
   max_gross_exposure_yen: 100000000
   max_single_name_exposure_yen: 20000000
-  max_long_exposure_yen: 100000000
-  max_short_exposure_yen: 100000000
+  max_long_exposure_yen: 50000000
+  max_short_exposure_yen: 50000000
+
+  # long-short戦略では片側だけの注文を禁止
+  require_both_sides: true
+
+  # longとshortの元本差の許容上限
+  max_net_exposure_yen: 5000000
+
   # 本番デフォルト: false（shortability 未確認の売りを出さない）
   allow_short_without_confirmed_shortability: false
 

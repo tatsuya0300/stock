@@ -61,43 +61,89 @@ def _fetch_prices_incremental(
     *,
     dry_run: bool = False,
 ) -> pd.DataFrame:
-    """DB にあれば差分取得、無ければ初期ヒストリを取得。"""
-    if dry_run or storage is None:
-        start = as_of - timedelta(days=_INITIAL_HISTORY_CALENDAR_DAYS)
-        # datasource 側で inclusive に正規化される前提
-        return ds.fetch_daily(codes, start, as_of)
+    """銘柄単位で価格を差分取得する。
 
-    # 既存の最終日を確認
+    注意:
+      - 新規銘柄は初期履歴を取得
+      - 既存銘柄は銘柄ごとの最終日翌日から取得
+      - 同じ取得開始日の銘柄はまとめてAPIへ渡す
+    """
+    history_start = as_of - timedelta(days=_INITIAL_HISTORY_CALENDAR_DAYS)
+
+    normalized_codes = sorted({str(code) for code in codes})
+
+    if not normalized_codes:
+        return pd.DataFrame()
+
+    if dry_run or storage is None:
+        return ds.fetch_daily(
+            normalized_codes,
+            history_start,
+            as_of,
+        )
+
     existing = storage.load_prices(
-        codes,
-        start=(as_of - timedelta(days=_INITIAL_HISTORY_CALENDAR_DAYS)).isoformat(),
+        normalized_codes,
+        start=history_start.isoformat(),
         end=as_of.isoformat(),
     )
 
-    if existing.empty:
-        start = as_of - timedelta(days=_INITIAL_HISTORY_CALENDAR_DAYS)
-        fresh = ds.fetch_daily(codes, start, as_of)
-        if not fresh.empty:
-            storage.upsert_prices(fresh)
-        return fresh
+    # start日ごとにコードをグループ化してAPI呼出回数を抑える
+    fetch_groups: dict[date, list[str]] = {}
 
-    last_date = pd.to_datetime(existing["date"]).max().date()
-    if last_date >= as_of:
-        # 当日まで揃っている
-        return existing[existing["date"] <= str(as_of)]
+    for code in normalized_codes:
+        code_rows = existing[existing["code"].astype(str) == code]
 
-    # 不足分のみ取得
-    start = last_date + timedelta(days=1)
-    fresh = ds.fetch_daily(codes, start, as_of)
-    if not fresh.empty:
+        if code_rows.empty:
+            fetch_start = history_start
+        else:
+            last_date = pd.to_datetime(code_rows["date"]).max().date()
+            fetch_start = last_date + timedelta(days=1)
+
+        if fetch_start <= as_of:
+            fetch_groups.setdefault(fetch_start, []).append(code)
+
+    fetched_frames: list[pd.DataFrame] = []
+
+    for fetch_start, group_codes in sorted(fetch_groups.items()):
+        fresh = ds.fetch_daily(
+            group_codes,
+            fetch_start,
+            as_of,
+        )
+
+        if fresh is None or fresh.empty:
+            log.warning(
+                "価格差分取得失敗: start=%s codes=%s",
+                fetch_start,
+                group_codes[:10],
+            )
+            continue
+
         storage.upsert_prices(fresh)
-    combined = pd.concat([existing, fresh], ignore_index=True)
-    return combined[combined["date"] <= str(as_of)]
+        fetched_frames.append(fresh)
+
+    # upsert後にDBから再読込し、既存＋新規を一貫した形で返す
+    combined = storage.load_prices(
+        normalized_codes,
+        start=history_start.isoformat(),
+        end=as_of.isoformat(),
+    )
+
+    if combined.empty:
+        return combined
+
+    combined["date"] = pd.to_datetime(combined["date"]).dt.strftime("%Y-%m-%d")
+
+    return (
+        combined[combined["date"] <= as_of.isoformat()]
+        .sort_values(["code", "date"])
+        .drop_duplicates(["code", "date"], keep="last")
+        .reset_index(drop=True)
+    )
 
 
-def morning_pipeline(
-    as_of: date, cfg: dict, dry_run: bool = False
-) -> pd.DataFrame:
+def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFrame:
     """寄前発注指示を生成し通知する。戻り値は最終 orders。"""
     if not is_tse_business_day(as_of):
         log.info("non-business day: %s", as_of)
@@ -116,9 +162,7 @@ def morning_pipeline(
 
     # yfinance 近似の再警告（本番誤用防止）
     if cfg.get("data", {}).get("source") == "yfinance":
-        log.warning(
-            "data.source=yfinance: turnover は近似。本番は jquants に切替必須。"
-        )
+        log.warning("data.source=yfinance: turnover は近似。本番は jquants に切替必須。")
     if not cfg.get("backtest", {}).get("impact_k_is_calibrated", False):
         log.info(
             "impact_k_bp=%.1f は未較正（impact_k_is_calibrated=false）",

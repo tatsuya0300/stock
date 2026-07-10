@@ -13,8 +13,10 @@ class RiskConfig:
         max_orders_per_day: int = 10,
         max_gross_exposure_yen: float = 100_000_000.0,
         max_single_name_exposure_yen: float = 20_000_000.0,
-        max_long_exposure_yen: float = 100_000_000.0,
-        max_short_exposure_yen: float = 100_000_000.0,
+        max_long_exposure_yen: float = 50_000_000.0,
+        max_short_exposure_yen: float = 50_000_000.0,
+        max_net_exposure_yen: float = 5_000_000.0,
+        require_both_sides: bool = True,
         allow_short_without_confirmed_shortability: bool = False,
     ):
         self.max_orders_per_day = int(max_orders_per_day)
@@ -22,6 +24,8 @@ class RiskConfig:
         self.max_single_name_exposure_yen = float(max_single_name_exposure_yen)
         self.max_long_exposure_yen = float(max_long_exposure_yen)
         self.max_short_exposure_yen = float(max_short_exposure_yen)
+        self.max_net_exposure_yen = float(max_net_exposure_yen)
+        self.require_both_sides = bool(require_both_sides)
         self.allow_short_without_confirmed_shortability = bool(
             allow_short_without_confirmed_shortability
         )
@@ -32,13 +36,16 @@ def risk_config_from_dict(d: dict) -> RiskConfig:
     return RiskConfig(
         max_orders_per_day=int(d.get("max_orders_per_day", 10)),
         max_gross_exposure_yen=float(d.get("max_gross_exposure_yen", 100_000_000.0)),
-        max_single_name_exposure_yen=float(
-            d.get("max_single_name_exposure_yen", 20_000_000.0)
-        ),
-        max_long_exposure_yen=float(d.get("max_long_exposure_yen", 100_000_000.0)),
-        max_short_exposure_yen=float(d.get("max_short_exposure_yen", 100_000_000.0)),
+        max_single_name_exposure_yen=float(d.get("max_single_name_exposure_yen", 20_000_000.0)),
+        max_long_exposure_yen=float(d.get("max_long_exposure_yen", 50_000_000.0)),
+        max_short_exposure_yen=float(d.get("max_short_exposure_yen", 50_000_000.0)),
+        max_net_exposure_yen=float(d.get("max_net_exposure_yen", 5_000_000.0)),
+        require_both_sides=bool(d.get("require_both_sides", True)),
         allow_short_without_confirmed_shortability=bool(
-            d.get("allow_short_without_confirmed_shortability", False)
+            d.get(
+                "allow_short_without_confirmed_shortability",
+                False,
+            )
         ),
     )
 
@@ -55,6 +62,8 @@ def apply_order_risk_limits(
     - 1銘柄あたり max_single_name_exposure_yen 以下
     - 総エクスポージャー制限（BUY/SELL 別 + グロス）
     - 発注件数上限
+    - long/short 両側必須（require_both_sides）
+    - net exposure 制限（max_net_exposure_yen）
 
     Args:
         orders: code, side, value_yen, shortable を含む DataFrame。
@@ -78,6 +87,12 @@ def apply_order_risk_limits(
     # SELL は shortable 確認済みのみ
     if not risk.allow_short_without_confirmed_shortability:
         out = out[~((out["side"] == "SELL") & (~out["shortable"]))]
+
+    valid_side = out["side"].isin({"BUY", "SELL"})
+    out = out.loc[valid_side].copy()
+
+    if out.empty:
+        return out
 
     out = out[out["value_yen"] > 0]
     out = out[out["value_yen"] <= risk.max_single_name_exposure_yen]
@@ -127,4 +142,55 @@ def apply_order_risk_limits(
 
     if not selected:
         return out.iloc[0:0].copy()
-    return pd.DataFrame(selected).reset_index(drop=True)
+
+    selected_df = pd.DataFrame(selected).reset_index(drop=True)
+
+    def exposure(frame: pd.DataFrame, side: str) -> float:
+        return float(
+            frame.loc[
+                frame["side"] == side,
+                "value_yen",
+            ].sum()
+        )
+
+    # 片側だけの注文を禁止
+    if risk.require_both_sides:
+        sides = set(selected_df["side"])
+
+        if not {"BUY", "SELL"}.issubset(sides):
+            return selected_df.iloc[0:0].copy()
+
+    # net exposureを満たすまで弱い注文から削除
+    while not selected_df.empty:
+        long_exp = exposure(selected_df, "BUY")
+        short_exp = exposure(selected_df, "SELL")
+        net_exp = long_exp - short_exp
+
+        if abs(net_exp) <= risk.max_net_exposure_yen:
+            break
+
+        excessive_side = "BUY" if net_exp > 0 else "SELL"
+        candidates = selected_df[selected_df["side"] == excessive_side]
+
+        if candidates.empty:
+            break
+
+        if score_col in candidates.columns:
+            drop_index = candidates[score_col].idxmin()
+        else:
+            drop_index = candidates["value_yen"].idxmin()
+
+        selected_df = selected_df.drop(index=drop_index).reset_index(drop=True)
+
+    if risk.require_both_sides:
+        sides = set(selected_df["side"])
+        if not {"BUY", "SELL"}.issubset(sides):
+            return selected_df.iloc[0:0].copy()
+
+    long_exp = exposure(selected_df, "BUY")
+    short_exp = exposure(selected_df, "SELL")
+
+    if abs(long_exp - short_exp) > risk.max_net_exposure_yen:
+        return selected_df.iloc[0:0].copy()
+
+    return selected_df
