@@ -13,7 +13,12 @@ import pandas as pd
 
 from .adv import rolling_adv_before
 from .calendar import previous_business_day
-from .risk import RiskConfig, apply_order_risk_limits
+from .risk import (
+    RiskConfig,
+    RiskSelectionResult,
+    apply_order_risk_limits,
+    select_orders_with_reasons,
+)
 from .sizing import compute_size
 
 
@@ -40,10 +45,7 @@ def is_shortable_asof(
         return False
 
     latest = past.sort_values("date").iloc[-1]
-    return (
-        int(latest["is_margin_lendable"]) == 1
-        and int(latest["short_restricted"]) == 0
-    )
+    return int(latest["is_margin_lendable"]) == 1 and int(latest["short_restricted"]) == 0
 
 
 def _ref_rows_before(prices: pd.DataFrame, as_of: date | str) -> pd.DataFrame:
@@ -54,7 +56,6 @@ def _ref_rows_before(prices: pd.DataFrame, as_of: date | str) -> pd.DataFrame:
     if prev.empty:
         return pd.DataFrame()
     return prev.groupby("code").tail(1).set_index("code")
-
 
 
 def signals_to_orders(
@@ -183,3 +184,15 @@ def signals_to_orders(
     orders = apply_order_risk_limits(orders, risk_cfg, score_col="score")
 
     return orders
+
+
+def apply_order_risk_with_audit(
+    orders: pd.DataFrame,
+    risk_cfg: RiskConfig,
+) -> RiskSelectionResult:
+    """注文へリスク制限を適用し、採用・不採用を両方返す。"""
+    return select_orders_with_reasons(
+        orders,
+        risk_cfg,
+        score_col="score",
+    )
