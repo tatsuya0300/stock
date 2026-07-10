@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from jp_signal.portfolio import PortfolioBacktester
 from jp_signal.risk import RiskConfig
@@ -236,7 +237,318 @@ def test_nav_accounting_identity():
 
     ledger = result.daily_ledger
 
-    expected_nav = ledger["cash"] + ledger["long_exposure"] - ledger["short_exposure"]
+    expected_nav = (
+        ledger["cash"]
+        + ledger["long_exposure"]
+        - ledger["short_exposure"]
+        - ledger["accrued_carry"]
+    )
     error = (ledger["nav"] - expected_nav).abs()
 
     assert float(error.max()) < 0.01
+
+
+def test_short_trade_cash_and_nav_accounting():
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "6758",
+                "name": "Sony",
+                "side": "SELL",
+                "qty": 50,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": True,
+            }
+        ]
+    )
+
+    result = make_backtester().run(
+        orders,
+        make_prices(),
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    assert len(result.trades) == 1
+
+    trade = result.trades.iloc[0]
+
+    # 199円で50株売り、198円で買い戻し。
+    assert trade["entry"] == pytest.approx(199.0)
+    assert trade["exit"] == pytest.approx(198.0)
+    assert trade["gross_pnl"] == pytest.approx(50.0)
+    assert trade["pnl"] == pytest.approx(50.0)
+
+    final_ledger = result.daily_ledger.iloc[-1]
+
+    assert final_ledger["cash"] == pytest.approx(1_000_050.0)
+    assert final_ledger["nav"] == pytest.approx(1_000_050.0)
+
+
+def test_short_flat_price_does_not_create_artificial_cash():
+    prices = make_prices().copy()
+
+    mask = (
+        (prices["code"] == "6758")
+        & prices["date"].isin(["2024-01-03", "2024-01-04"])
+    )
+
+    prices.loc[mask, "open"] = 200.0
+    prices.loc[mask, "high"] = 200.0
+    prices.loc[mask, "low"] = 200.0
+    prices.loc[mask, "close"] = 200.0
+
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "6758",
+                "side": "SELL",
+                "qty": 50,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": True,
+            }
+        ]
+    )
+
+    result = make_backtester().run(
+        orders,
+        prices,
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades.iloc[0]["gross_pnl"] == pytest.approx(0.0)
+    assert result.daily_ledger.iloc[-1]["nav"] == pytest.approx(1_000_000.0)
+
+
+def test_carry_cost_reduces_cash_and_nav():
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "6758",
+                "side": "SELL",
+                "qty": 50,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": True,
+            }
+        ]
+    )
+
+    bt = PortfolioBacktester(
+        initial_capital=1_000_000,
+        risk=make_risk(),
+        impact_k_bp=0.0,
+        commission_bp=0.0,
+        half_spread_bp=0.0,
+        annual_interest_rate=0.0,
+        annual_lending_rate=0.365,
+        adv_window=2,
+        min_adv_periods=2,
+    )
+
+    result = bt.run(
+        orders,
+        make_prices(),
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    trade = result.trades.iloc[0]
+
+    expected_carry = 199.0 * (0.365 / 365.0) * 1 * 50
+
+    expected_pnl = 50.0 - expected_carry
+
+    assert trade["carry_days"] == 1
+    assert trade["carry_cost"] == pytest.approx(expected_carry)
+    assert trade["pnl"] == pytest.approx(expected_pnl)
+
+    assert result.daily_ledger.iloc[-1]["nav"] == pytest.approx(
+        1_000_000.0 + expected_pnl
+    )
+
+
+def test_missing_exact_exit_price_defers_exit():
+    prices = make_prices()
+
+    # 7203の予定決済日2024-01-04だけを欠損させる。
+    # 他銘柄には2024-01-04があるため、市場営業日自体は残る。
+    prices = prices[
+        ~(
+            (prices["code"] == "7203")
+            & (prices["date"] == "2024-01-04")
+        )
+    ].copy()
+
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            }
+        ]
+    )
+
+    result = make_backtester().run(
+        orders,
+        prices,
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    assert len(result.trades) == 1
+
+    trade = result.trades.iloc[0]
+
+    assert trade["planned_exit_date"] == "2024-01-04"
+    assert trade["exit_date"] == "2024-01-05"
+
+    assert "NO_EXIT_PRICE_DEFERRED" in set(result.rejected_orders["reason"])
+
+
+def test_unsupported_order_type_is_rejected():
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "LIMIT",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            }
+        ]
+    )
+
+    result = make_backtester().run(
+        orders,
+        make_prices(),
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    assert result.trades.empty
+    assert "UNSUPPORTED_ORDER_TYPE" in set(result.rejected_orders["reason"])
+
+
+def test_duplicate_code_same_day_is_rejected():
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 2.0,
+                "shortable": False,
+            },
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            },
+        ]
+    )
+
+    result = make_backtester().run(
+        orders,
+        make_prices(),
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    assert len(result.trades) == 1
+    assert "DUPLICATE_CODE_SAME_DAY" in set(result.rejected_orders["reason"])
+
+
+def test_order_without_exit_date_is_rejected():
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-05",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            }
+        ]
+    )
+
+    result = make_backtester().run(
+        orders,
+        make_prices(),
+        start_date="2024-01-05",
+        end_date="2024-01-05",
+    )
+
+    assert result.trades.empty
+    assert "NO_EXIT_DATE_WITHIN_TEST_WINDOW" in set(result.rejected_orders["reason"])
+
+
+def test_final_nav_equals_total_realized_pnl():
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            },
+            {
+                "date": "2024-01-03",
+                "code": "6758",
+                "side": "SELL",
+                "qty": 50,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": True,
+            },
+        ]
+    )
+
+    result = make_backtester().run(
+        orders,
+        make_prices(),
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    assert result.open_positions.empty
+
+    realized_pnl = float(result.trades["pnl"].sum())
+    final_nav = float(result.daily_ledger.iloc[-1]["nav"])
+
+    assert final_nav - 1_000_000 == pytest.approx(realized_pnl)

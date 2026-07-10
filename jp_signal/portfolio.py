@@ -53,6 +53,7 @@ class Position:
     score: float
     last_carry_date: pd.Timestamp
     accrued_carry: float = 0.0
+    accrued_carry_days: int = 0
 
 
 @dataclass
@@ -412,6 +413,13 @@ class PortfolioBacktester:
         daily_borrow_rate: float,
         daily_lend_rate: float,
     ) -> list[Position]:
+        """未決済ポジションのcarryを暦日単位で発生させる。
+
+        carryはここではcashから控除せず、Position.accrued_carryに
+        未払費用として蓄積する。
+
+        NAVでは未払carryを控除し、決済時にcashから支払う。
+        """
         updated: list[Position] = []
         for pos in positions:
             if pos.last_carry_date >= current_date:
@@ -427,6 +435,7 @@ class PortfolioBacktester:
             carry = pos.entry_price * rate * cal_days * pos.qty
 
             pos.accrued_carry += carry
+            pos.accrued_carry_days += cal_days
             pos.last_carry_date = current_date
             updated.append(pos)
 
@@ -515,21 +524,35 @@ class PortfolioBacktester:
 
             positions = remaining_positions
 
+            deferred_positions: list[Position] = []
+            settled_positions: list[Position] = []
+
             for pos in closing_positions:
-                exit_price_raw = self._mark_to_market_price(
-                    history,
-                    pos.code,
-                    date,
-                    pos.entry_price,
+                # 決済日の価格を取得。欠損している場合は決済を延期
+                frame = history.get(pos.code)
+                exact_available = (
+                    frame is not None
+                    and not frame.empty
+                    and date in frame.index
+                    and np.isfinite(frame.loc[date, "close"])
+                    and frame.loc[date, "close"] > 0
                 )
+                if not exact_available:
+                    deferred_positions.append(pos)
+                    continue
+
+                exit_price_raw = float(frame.loc[date, "close"])
 
                 exit_adv = self._adv_for_order(history, pos.code, date)
+                if self.require_liquidity_data and not self._is_valid_adv(exit_adv):
+                    deferred_positions.append(pos)
+                    continue
 
                 direction = -self._side_sign(pos.side)
                 exit_price, exit_slippage_bp = self._execution_price(
                     base_price=exit_price_raw,
                     qty=pos.qty,
-                    adv=exit_adv if self._is_valid_adv(exit_adv) else 0.0,
+                    adv=exit_adv,
                     direction=direction,
                 )
 
@@ -537,7 +560,16 @@ class PortfolioBacktester:
                 total_carry = pos.accrued_carry
                 net_pnl = gross_pnl - total_carry
 
-                cash += exit_price * pos.qty
+                # cash更新: 決済
+                if pos.side == "BUY":
+                    cash += exit_price * pos.qty
+                else:
+                    cash -= exit_price * pos.qty
+
+                # carryをcashから支払う
+                cash -= total_carry
+
+                settled_positions.append(pos)
 
                 trades.append(
                     {
@@ -548,6 +580,7 @@ class PortfolioBacktester:
                         "qty": pos.qty,
                         "entry_date": str(pos.entry_date.date()),
                         "exit_date": str(date.date()),
+                        "planned_exit_date": str(pos.planned_exit_date.date()),
                         "entry": pos.entry_price,
                         "exit": exit_price,
                         "entry_adv": pos.entry_adv,
@@ -555,10 +588,24 @@ class PortfolioBacktester:
                         "entry_slippage_bp": pos.entry_slippage_bp,
                         "exit_slippage_bp": exit_slippage_bp,
                         "carry_cost": total_carry,
-                        "carry_days": (date - pos.last_carry_date).days,
+                        "carry_days": pos.accrued_carry_days,
                         "gross_pnl": gross_pnl,
                         "pnl": net_pnl,
                         "score": pos.score,
+                    }
+                )
+
+            positions = remaining_positions + deferred_positions
+
+            for dpos in deferred_positions:
+                rejected_orders.append(
+                    {
+                        "code": dpos.code,
+                        "name": dpos.name,
+                        "side": dpos.side,
+                        "qty": dpos.qty,
+                        "rejection_date": str(date.date()),
+                        "reason": "NO_EXIT_PRICE_DEFERRED",
                     }
                 )
 
@@ -567,17 +614,23 @@ class PortfolioBacktester:
             candidates: list[dict] = []
 
             existing_codes: set[str] = {p.code for p in positions}
+            seen_codes_today: set[str] = set()
 
             for _, row in day_orders.iterrows():
                 code = str(row["code"])
                 side = str(row["side"]).upper()
                 qty = int(row["qty"])
                 holding_days = int(row["holding_days"])
+                order_type = str(row.get("order_type", "")).upper()
 
                 reject = None
 
-                if code in existing_codes:
+                if order_type not in {"MKT_OPEN", ""}:
+                    reject = "UNSUPPORTED_ORDER_TYPE"
+                elif code in existing_codes:
                     reject = "EXISTING_POSITION"
+                elif code in seen_codes_today:
+                    reject = "DUPLICATE_CODE_SAME_DAY"
                 elif side not in {"BUY", "SELL"}:
                     reject = "INVALID_SIDE"
                 elif qty <= 0:
@@ -645,6 +698,17 @@ class PortfolioBacktester:
                 entry_value = entry_price * qty
 
                 exit_date = self._planned_exit_date(trading_dates, date, holding_days)
+                if exit_date is None:
+                    rejected_orders.append(
+                        {
+                            **row.to_dict(),
+                            "rejection_date": str(date.date()),
+                            "reason": "NO_EXIT_DATE_WITHIN_TEST_WINDOW",
+                        }
+                    )
+                    continue
+
+                seen_codes_today.add(code)
 
                 candidates.append(
                     {
@@ -681,9 +745,6 @@ class PortfolioBacktester:
 
             # --- 4. open new positions ---
             for cand in selected:
-                if cand["exit_date"] is None:
-                    continue
-
                 pos = Position(
                     position_id=uuid.uuid4().hex[:12],
                     code=cand["code"],
@@ -699,12 +760,16 @@ class PortfolioBacktester:
                     last_carry_date=date,
                 )
 
-                cash -= cand["entry_price"] * cand["qty"] * self._side_sign(cand["side"])
+                if cand["side"] == "BUY":
+                    cash -= cand["entry_price"] * cand["qty"]
+                else:
+                    cash += cand["entry_price"] * cand["qty"]
                 positions.append(pos)
 
             # --- 5. record daily ledger ---
             exposure = self._exposure(positions, history, date)
-            nav = cash + exposure["long"] - exposure["short"]
+            total_accrued_carry = sum(p.accrued_carry for p in positions)
+            nav = cash + exposure["long"] - exposure["short"] - total_accrued_carry
 
             daily_ledger.append(
                 {
@@ -715,6 +780,7 @@ class PortfolioBacktester:
                     "gross_exposure": exposure["gross"],
                     "net_exposure": exposure["net"],
                     "open_position_count": len(positions),
+                    "accrued_carry": total_accrued_carry,
                     "nav": nav,
                 }
             )
