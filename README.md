@@ -43,11 +43,14 @@ FR-NOTIFY はアダプタ差し替え設計（`ConsoleNotifier` 先行、Discord
 │   └── topix500_sample.csv    # 動作確認用サンプル（デフォルト）
 ├── scripts/
 │   ├── run_backtest.py
+│   ├── run_portfolio_backtest.py
 │   ├── build_pit_universe_from_events.py
 │   ├── build_universe_from_jpx_weights.py
 │   └── import_fills.py
 ├── tests/
 └── jp_signal/
+    ├── portfolio.py
+    └── portfolio_metrics.py
     ├── __init__.py
     ├── calendar.py
     ├── config.py
@@ -193,6 +196,14 @@ export DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
 5. `impact_k_bp` は未較正。
 6. 生存者バイアス: point-in-time ユニバース実データが無いと未解消。
 7. 本改訂は正しさ向上が目的であり、収益性を保証しない。
+
+### バックテスト上の重要な制約
+
+- PortfolioBacktesterはMKT_OPENエントリー、MKT_CLOSE決済のみ対応。
+- 決済日の当該銘柄価格またはADVが欠損した場合、翌有効日まで決済を延期する。
+- carryは保有中は未払費用としてNAVから控除し、決済時にcashから控除する。
+- corporate action、配当、追証、強制決済、部分約定は未実装。
+- production設定のcommission/spread/impactは暫定値であり、実fillsによる較正が必要。
 
 ## 開発
 
