@@ -40,6 +40,7 @@ class Backtester:
         require_liquidity_data: bool = True,
         adv_window: int = 20,
         zero_carry_for_intraday: bool = True,
+        require_confirmed_shortability: bool = True,
     ):
         self.k = float(impact_k_bp)
         self.annual_int = float(annual_interest_rate)
@@ -51,6 +52,7 @@ class Backtester:
         self.require_liquidity_data = bool(require_liquidity_data)
         self.adv_window = max(1, int(adv_window))
         self.zero_carry_for_intraday = bool(zero_carry_for_intraday)
+        self.require_confirmed_shortability = bool(require_confirmed_shortability)
 
     # ------------------------------------------------------------ fill models
     @staticmethod
@@ -259,7 +261,7 @@ class Backtester:
                 continue
 
             # FR-BT-05: 売り可否チェック
-            if s["side"] == "SELL":
+            if s["side"] == "SELL" and self.require_confirmed_shortability:
                 snap = self._latest_shortability_before(sh, code, d) if sh is not None else None
                 shortable = (
                     snap is not None

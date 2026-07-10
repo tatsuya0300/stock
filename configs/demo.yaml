@@ -1,0 +1,50 @@
+data:
+  source: "yfinance"
+  db_path: "./data/jp_signal_demo.sqlite"
+  allow_approximate_turnover: true
+
+universe:
+  file: "./data/topix500_sample.csv"
+
+model:
+  lookback: 5
+  top_n: 5
+
+backtest:
+  start: "2022-01-01"
+  end: "2024-12-31"
+  impact_k_bp: 30.0
+  impact_k_is_calibrated: false
+  annual_interest_rate: 0.02
+  short_lending_rate: 0.02
+  adv_window: 20
+  holding_days: 1
+  commission_bp: 0.0
+  half_spread_bp: 0.0
+  output_dir: "./data/bt_out_demo"
+  allow_unconfirmed_short_in_bt: true
+  initial_capital: 100000000
+  risk_free_rate: 0.0
+
+sizing:
+  adv_ratio: 0.001
+  adv_ratio_cap: 0.002
+  adv_window: 20
+  min_adv_periods: 10
+  market_open_unit_cap: 50
+  unit: 100
+
+risk:
+  max_orders_per_day: 10
+  max_gross_exposure_yen: 100000000
+  max_single_name_exposure_yen: 20000000
+  max_long_exposure_yen: 50000000
+  max_short_exposure_yen: 50000000
+  require_both_sides: false
+  max_net_exposure_yen: 100000000
+  allow_short_without_confirmed_shortability: true
+
+notify:
+  channel: "console"
+  morning_time: "08:15"
+  closing_time: "15:00"

@@ -9,6 +9,7 @@ P0:
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from datetime import timedelta
@@ -27,8 +28,19 @@ from jp_signal.storage import Storage
 from jp_signal.universe import load_universe
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run jp_signal backtest")
+    p.add_argument(
+        "--config",
+        default="config.yaml",
+        help="設定ファイルパス",
+    )
+    return p.parse_args()
+
+
 def main() -> None:
-    cfg = load_config()
+    args = _parse_args()
+    cfg = load_config(args.config)
 
     # P0: 近似 turnover で impact/sizing を使う BT を拒否
     guard_approximate_turnover(cfg, context="run_backtest")
@@ -105,6 +117,10 @@ def main() -> None:
         else:
             risk_cfg.allow_short_without_confirmed_shortability = False
 
+        require_confirmed_shortability = not bool(
+            cfg.get("backtest", {}).get("allow_unconfirmed_short_in_bt", False)
+        )
+
         all_dates = sorted(
             d
             for d in prices["date"].unique()
@@ -112,7 +128,7 @@ def main() -> None:
         )
 
         signal_frames: list[pd.DataFrame] = []
-        for d in all_dates[20:]:
+        for d in all_dates:
             univ_d = load_universe(cfg["universe"], as_of=d)
             codes_d = set(univ_d["code"].tolist())
             px_d = prices[prices["code"].isin(codes_d)]
@@ -157,6 +173,7 @@ def main() -> None:
             adv_window=int(cfg["backtest"].get("adv_window", 20)),
             require_liquidity_data=True,
             zero_carry_for_intraday=True,
+            require_confirmed_shortability=require_confirmed_shortability,
         )
         result = bt.run(
             signals,
