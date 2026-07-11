@@ -60,17 +60,13 @@ def is_shortable_asof(
         "short_restricted",
     }
 
-    if pit_columns.issubset(
-        shortability.columns
-    ):
+    if pit_columns.issubset(shortability.columns):
         decision = decide_shortability(
             shortability,
             code=code,
             as_of=as_of,
             requested_short_type="system",
-            max_age=pd.Timedelta(
-                days=max_age_calendar_days
-            ),
+            max_age=pd.Timedelta(days=max_age_calendar_days),
         )
         return decision.is_shortable
 
@@ -375,6 +371,7 @@ def build_orders_with_audit(
                     _reject(signal, stage=adv_stage, reason="ADV_FALLBACK_ZERO")
                     continue
 
+        enforce_cap = bool(sizing_cfg.get("enforce_market_open_unit_cap", False))
         qty, yen, warn = compute_size(
             adv,
             ref,
@@ -383,17 +380,14 @@ def build_orders_with_audit(
             unit=unit,
             market_open_unit_cap=int(sizing_cfg.get("market_open_unit_cap", 50)),
             is_market_open_order=(order_type == "MKT_OPEN"),
+            enforce_market_open_unit_cap=enforce_cap,
         )
 
         if qty == 0:
             _reject(signal, stage="SIZING", reason="QTY_ZERO")
             continue
 
-        shortability_as_of = (
-            decision_at
-            if decision_at is not None
-            else as_of_d
-        )
+        shortability_as_of = decision_at if decision_at is not None else as_of_d
 
         shortable = is_shortable_asof(
             shortability,
@@ -414,6 +408,8 @@ def build_orders_with_audit(
             "qty": qty,
             "ref_price": ref,
             "value_yen": yen,
+            "risk_value_yen": yen
+            * (1.0 + float(sizing_cfg.get("reference_price_buffer_ratio", 0.0))),
             "score": float(signal.get("score", 0)),
             "warn": warn,
             "shortable": shortable,
@@ -473,8 +469,7 @@ def build_orders_with_audit(
 
         if missing_output_columns:
             raise RuntimeError(
-                "selected orders missing output columns: "
-                f"{sorted(missing_output_columns)}"
+                f"selected orders missing output columns: {sorted(missing_output_columns)}"
             )
 
         selected_out = selected[output_columns].copy()
