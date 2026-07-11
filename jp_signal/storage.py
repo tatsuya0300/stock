@@ -214,14 +214,28 @@ ON shortability_observations(
 
 
 class Storage:
-    def __init__(self, path: str):
+    def __init__(self, path: str, read_only: bool = False):
+        self.read_only = read_only
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
+        uri = f"file:{path}?mode=ro" if read_only else path
+        self.conn = sqlite3.connect(
+            uri,
+            check_same_thread=False,
+            timeout=30,
+            uri=read_only,
+        )
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA foreign_keys=ON;")
-        self.conn.executescript(SCHEMA)
-        self._migrate()
-        self.set_metadata("schema_version", str(SCHEMA_VERSION))
+        if not read_only:
+            self.conn.executescript(SCHEMA)
+            self._migrate()
+            self.set_metadata("schema_version", str(SCHEMA_VERSION))
+
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise RuntimeError(
+                "Storage is opened in read-only mode. Call write operations are not allowed."
+            )
 
     def _initial_setup(self) -> None:
         """完全新規DB用の初期セットアップ。"""
@@ -278,7 +292,16 @@ class Storage:
             self.conn.execute("UPDATE prices SET adj_low = low WHERE adj_low IS NULL")
             self.conn.execute("UPDATE prices SET adj_close = close WHERE adj_close IS NULL")
 
-    def upsert_prices(self, df: pd.DataFrame) -> None:
+            # price_observations: NULL available_at → fetched_at で補完
+            if self._table_exists("price_observations"):
+                self.conn.execute(
+                    "UPDATE price_observations "
+                    "SET available_at = fetched_at "
+                    "WHERE available_at IS NULL"
+                )
+
+    def _upsert_prices_no_commit(self, df: pd.DataFrame) -> None:
+        """プライベートメソッド: 呼び出し側トランザクション内で使用すること。"""
         if df is None or df.empty:
             return
 
@@ -314,24 +337,21 @@ class Storage:
             volume = excluded.volume,
             turnover = excluded.turnover
         """
-        with self.conn:
-            self.conn.executemany(sql, records)
+        self.conn.executemany(sql, records)
 
-    def record_price_observations(
+    def upsert_prices(self, df: pd.DataFrame) -> None:
+        self._require_writable()
+        with self.conn:
+            self._upsert_prices_no_commit(df)
+
+    def _record_price_observations_no_commit(
         self,
         df: pd.DataFrame,
         *,
         source: str,
         available_at: str | None = None,
     ) -> int:
-        """価格データのリビジョン履歴を price_observations に記録する。
-
-        各(code, date, source) のペイロード内容が前回と異なる場合のみ
-        新しい行を挿入する（同一ハッシュならスキップ）。
-
-        Returns:
-            新規挿入行数。
-        """
+        """プライベートメソッド: 呼び出し側トランザクション内で使用すること。"""
         if df is None or df.empty:
             return 0
 
@@ -362,11 +382,40 @@ class Storage:
                 )
             )
 
-        with self.conn:
-            self.conn.executemany(sql, records)
-            n = self.conn.total_changes
+        inserted = 0
+        for r in records:
+            cursor = self.conn.execute(sql, r)
+            inserted += max(int(cursor.rowcount), 0)
 
-        return n
+        return inserted
+
+    def record_price_observations(
+        self,
+        df: pd.DataFrame,
+        *,
+        source: str,
+        available_at: str | None = None,
+    ) -> int:
+        """価格データのリビジョン履歴を price_observations に記録する。
+
+        各(code, date, source) のペイロード内容が前回と異なる場合のみ
+        新しい行を挿入する（同一ハッシュならスキップ）。
+
+        Args:
+            df: 価格データフレーム
+            source: データソース名（例: "jquants", "yfinance"）
+            available_at: ISO 8601 形式の利用可能時刻（None なら fetched_at と同じ）
+
+        Returns:
+            新規挿入行数。
+        """
+        self._require_writable()
+        with self.conn:
+            return self._record_price_observations_no_commit(
+                df,
+                source=source,
+                available_at=available_at,
+            )
 
     def ingest_prices(
         self,
@@ -390,8 +439,12 @@ class Storage:
             return
 
         with self.conn:
-            self.record_price_observations(df, source=source, available_at=available_at)
-            self.upsert_prices(df)
+            self._record_price_observations_no_commit(
+                df,
+                source=source,
+                available_at=available_at,
+            )
+            self._upsert_prices_no_commit(df)
 
     def load_prices(self, codes: list[str], start: str, end: str) -> pd.DataFrame:
         if not codes:
@@ -781,9 +834,7 @@ class Storage:
             normalize_shortability_observations,
         )
 
-        x = normalize_shortability_observations(
-            frame
-        )
+        x = normalize_shortability_observations(frame)
 
         if x.empty:
             return 0
@@ -814,36 +865,18 @@ class Storage:
                     sql,
                     (
                         str(row.code),
-                        pd.Timestamp(
-                            row.effective_at
-                        ).isoformat(),
-                        pd.Timestamp(
-                            row.fetched_at
-                        ).isoformat(),
-                        pd.Timestamp(
-                            row.available_at
-                        ).isoformat(),
+                        pd.Timestamp(row.effective_at).isoformat(),
+                        pd.Timestamp(row.fetched_at).isoformat(),
+                        pd.Timestamp(row.available_at).isoformat(),
                         str(row.source),
                         str(row.short_type),
                         int(row.is_shortable),
-                        (
-                            None
-                            if pd.isna(
-                                row.is_margin_lendable
-                            )
-                            else int(
-                                row.is_margin_lendable
-                            )
-                        ),
+                        (None if pd.isna(row.is_margin_lendable) else int(row.is_margin_lendable)),
                         int(row.short_restricted),
                         (
                             None
-                            if pd.isna(
-                                row.stock_loan_fee_annual
-                            )
-                            else float(
-                                row.stock_loan_fee_annual
-                            )
+                            if pd.isna(row.stock_loan_fee_annual)
+                            else float(row.stock_loan_fee_annual)
                         ),
                         str(row.payload_hash),
                     ),
@@ -881,25 +914,16 @@ class Storage:
         if not codes:
             return pd.DataFrame(columns=columns)
 
-        normalized_codes = [
-            str(code).strip()
-            for code in codes
-        ]
+        normalized_codes = [str(code).strip() for code in codes]
 
         before = pd.Timestamp(available_before)
 
         if before.tzinfo is None:
-            before = before.tz_localize(
-                "Asia/Tokyo"
-            )
+            before = before.tz_localize("Asia/Tokyo")
 
-        before_utc = before.tz_convert(
-            "UTC"
-        ).isoformat()
+        before_utc = before.tz_convert("UTC").isoformat()
 
-        placeholders = ",".join(
-            ["?"] * len(normalized_codes)
-        )
+        placeholders = ",".join(["?"] * len(normalized_codes))
 
         where = [
             f"code IN ({placeholders})",
@@ -914,17 +938,11 @@ class Storage:
             after = pd.Timestamp(available_after)
 
             if after.tzinfo is None:
-                after = after.tz_localize(
-                    "Asia/Tokyo"
-                )
+                after = after.tz_localize("Asia/Tokyo")
 
-            after_utc = after.tz_convert(
-                "UTC"
-            ).isoformat()
+            after_utc = after.tz_convert("UTC").isoformat()
 
-            where.append(
-                "available_at >= ?"
-            )
+            where.append("available_at >= ?")
             params.append(after_utc)
 
         query = f"""
