@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -35,6 +36,31 @@ from .storage import Storage
 from .universe import load_universe
 
 log = logging.getLogger(__name__)
+
+
+def _morning_decision_at(
+    as_of: date,
+    cfg: dict,
+) -> pd.Timestamp:
+    """寄前判断時刻をtimezone-aware timestampで返す。"""
+    raw_time = str(
+        cfg.get("notify", {}).get(
+            "morning_time",
+            "08:15",
+        )
+    )
+
+    decision_time = time.fromisoformat(
+        raw_time
+    )
+
+    timestamp = datetime.combine(
+        as_of,
+        decision_time,
+        tzinfo=ZoneInfo("Asia/Tokyo"),
+    )
+
+    return pd.Timestamp(timestamp)
 
 # 初回取得時の過去日数（足りなければ随時追加）
 _INITIAL_HISTORY_CALENDAR_DAYS = 400
@@ -204,14 +230,34 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
                 )
                 return pd.DataFrame()
 
-        # shortability を DB から読み込み
+        # shortability を DB から読み込み（PIT優先）
+        decision_at = _morning_decision_at(
+            as_of,
+            cfg,
+        )
+
         shortability_df = pd.DataFrame()
         if not dry_run and storage is not None:
-            shortability_df = storage.load_shortability(
-                codes,
-                start=str(as_of - timedelta(days=30)),
-                end=str(as_of),
+            shortability_df = (
+                storage.load_shortability_observations(
+                    codes,
+                    available_before=decision_at,
+                    available_after=(
+                        decision_at
+                        - pd.Timedelta(days=30)
+                    ),
+                )
             )
+
+            # PITデータが無ければlegacy tableへfallback
+            if shortability_df.empty:
+                shortability_df = storage.load_shortability(
+                    codes,
+                    start=str(
+                        as_of - timedelta(days=30)
+                    ),
+                    end=str(as_of),
+                )
 
         model = MeanReversionRule(
             lookback=int(cfg.get("model", {}).get("lookback", 5)),
@@ -237,6 +283,7 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
             sig,
             df,
             as_of=as_of,
+            decision_at=decision_at,
             sizing_cfg=cfg["sizing"],
             risk_cfg=risk_cfg,
             shortability=shortability_df if not shortability_df.empty else None,

@@ -174,6 +174,42 @@ CREATE TABLE IF NOT EXISTS price_observations (
 
 CREATE INDEX IF NOT EXISTS idx_price_observations_lookup
 ON price_observations(code, date, source);
+
+CREATE TABLE IF NOT EXISTS shortability_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    code TEXT NOT NULL,
+    effective_at TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+
+    source TEXT NOT NULL,
+    short_type TEXT NOT NULL,
+
+    is_shortable INTEGER NOT NULL,
+    is_margin_lendable INTEGER,
+    short_restricted INTEGER NOT NULL,
+
+    stock_loan_fee_annual REAL,
+    payload_hash TEXT NOT NULL,
+
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE(payload_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shortability_observations_lookup
+ON shortability_observations(
+    code,
+    short_type,
+    available_at
+);
+
+CREATE INDEX IF NOT EXISTS idx_shortability_observations_effective
+ON shortability_observations(
+    code,
+    effective_at
+);
 """
 
 
@@ -735,6 +771,192 @@ class Storage:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+    def insert_shortability_observations(
+        self,
+        frame: pd.DataFrame,
+    ) -> int:
+        """PIT shortability観測を保存する。"""
+        from .shortability_pit import (
+            normalize_shortability_observations,
+        )
+
+        x = normalize_shortability_observations(
+            frame
+        )
+
+        if x.empty:
+            return 0
+
+        sql = """
+        INSERT INTO shortability_observations (
+            code,
+            effective_at,
+            fetched_at,
+            available_at,
+            source,
+            short_type,
+            is_shortable,
+            is_margin_lendable,
+            short_restricted,
+            stock_loan_fee_annual,
+            payload_hash
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(payload_hash) DO NOTHING
+        """
+
+        inserted = 0
+
+        with self.conn:
+            for row in x.itertuples(index=False):
+                cursor = self.conn.execute(
+                    sql,
+                    (
+                        str(row.code),
+                        pd.Timestamp(
+                            row.effective_at
+                        ).isoformat(),
+                        pd.Timestamp(
+                            row.fetched_at
+                        ).isoformat(),
+                        pd.Timestamp(
+                            row.available_at
+                        ).isoformat(),
+                        str(row.source),
+                        str(row.short_type),
+                        int(row.is_shortable),
+                        (
+                            None
+                            if pd.isna(
+                                row.is_margin_lendable
+                            )
+                            else int(
+                                row.is_margin_lendable
+                            )
+                        ),
+                        int(row.short_restricted),
+                        (
+                            None
+                            if pd.isna(
+                                row.stock_loan_fee_annual
+                            )
+                            else float(
+                                row.stock_loan_fee_annual
+                            )
+                        ),
+                        str(row.payload_hash),
+                    ),
+                )
+
+                inserted += max(
+                    int(cursor.rowcount),
+                    0,
+                )
+
+        return inserted
+
+    def load_shortability_observations(
+        self,
+        codes: list[str],
+        *,
+        available_before: str | pd.Timestamp,
+        available_after: str | pd.Timestamp | None = None,
+    ) -> pd.DataFrame:
+        """指定時刻までに利用可能だったPIT観測を読み込む。"""
+        columns = [
+            "code",
+            "effective_at",
+            "fetched_at",
+            "available_at",
+            "source",
+            "short_type",
+            "is_shortable",
+            "is_margin_lendable",
+            "short_restricted",
+            "stock_loan_fee_annual",
+            "payload_hash",
+        ]
+
+        if not codes:
+            return pd.DataFrame(columns=columns)
+
+        normalized_codes = [
+            str(code).strip()
+            for code in codes
+        ]
+
+        before = pd.Timestamp(available_before)
+
+        if before.tzinfo is None:
+            before = before.tz_localize(
+                "Asia/Tokyo"
+            )
+
+        before_utc = before.tz_convert(
+            "UTC"
+        ).isoformat()
+
+        placeholders = ",".join(
+            ["?"] * len(normalized_codes)
+        )
+
+        where = [
+            f"code IN ({placeholders})",
+            "available_at <= ?",
+        ]
+        params: list[str] = [
+            *normalized_codes,
+            before_utc,
+        ]
+
+        if available_after is not None:
+            after = pd.Timestamp(available_after)
+
+            if after.tzinfo is None:
+                after = after.tz_localize(
+                    "Asia/Tokyo"
+                )
+
+            after_utc = after.tz_convert(
+                "UTC"
+            ).isoformat()
+
+            where.append(
+                "available_at >= ?"
+            )
+            params.append(after_utc)
+
+        query = f"""
+        SELECT {", ".join(columns)}
+        FROM shortability_observations
+        WHERE {" AND ".join(where)}
+        ORDER BY
+            code,
+            available_at,
+            effective_at,
+            fetched_at
+        """
+
+        frame = pd.read_sql(
+            query,
+            self.conn,
+            params=params,
+        )
+
+        for column in [
+            "effective_at",
+            "fetched_at",
+            "available_at",
+        ]:
+            if column in frame.columns:
+                frame[column] = pd.to_datetime(
+                    frame[column],
+                    errors="raise",
+                    utc=True,
+                )
+
+        return frame
 
     def max_price_date(self, codes: list[str] | None = None) -> str | None:
         """prices テーブルの最大 date を返す。無ければ None。"""
