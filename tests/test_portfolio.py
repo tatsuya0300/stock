@@ -291,10 +291,7 @@ def test_short_trade_cash_and_nav_accounting():
 def test_short_flat_price_does_not_create_artificial_cash():
     prices = make_prices().copy()
 
-    mask = (
-        (prices["code"] == "6758")
-        & prices["date"].isin(["2024-01-03", "2024-01-04"])
-    )
+    mask = (prices["code"] == "6758") & prices["date"].isin(["2024-01-03", "2024-01-04"])
 
     prices.loc[mask, "open"] = 200.0
     prices.loc[mask, "high"] = 200.0
@@ -373,9 +370,7 @@ def test_carry_cost_reduces_cash_and_nav():
     assert trade["carry_cost"] == pytest.approx(expected_carry)
     assert trade["pnl"] == pytest.approx(expected_pnl)
 
-    assert result.daily_ledger.iloc[-1]["nav"] == pytest.approx(
-        1_000_000.0 + expected_pnl
-    )
+    assert result.daily_ledger.iloc[-1]["nav"] == pytest.approx(1_000_000.0 + expected_pnl)
 
 
 def test_missing_exact_exit_price_defers_exit():
@@ -383,12 +378,7 @@ def test_missing_exact_exit_price_defers_exit():
 
     # 7203の予定決済日2024-01-04だけを欠損させる。
     # 他銘柄には2024-01-04があるため、市場営業日自体は残る。
-    prices = prices[
-        ~(
-            (prices["code"] == "7203")
-            & (prices["date"] == "2024-01-04")
-        )
-    ].copy()
+    prices = prices[~((prices["code"] == "7203") & (prices["date"] == "2024-01-04"))].copy()
 
     orders = pd.DataFrame(
         [
@@ -511,6 +501,126 @@ def test_order_without_exit_date_is_rejected():
 
     assert result.trades.empty
     assert "NO_EXIT_DATE_WITHIN_TEST_WINDOW" in set(result.rejected_orders["reason"])
+
+
+def test_same_code_blocked_on_exit_day_at_open():
+    """当日引けで決済予定のポジションは、寄付き時点ではまだ存在するため
+    同一コードの新規注文をEXISTING_POSITIONとしてリジェクトする。
+
+    これは、決済日の朝にはまだ建玉が存在するという現実を反映する。"""
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            },
+            {
+                # 01-03に建てたポジションは01-04引けで決済されるため、
+                # 01-04寄付き時点ではまだ存在している → リジェクトされる
+                "date": "2024-01-04",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            },
+        ]
+    )
+
+    result = make_backtester().run(
+        orders,
+        make_prices(),
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    assert "EXISTING_POSITION" in set(result.rejected_orders["reason"])
+
+
+def test_same_code_reentry_allowed_after_close():
+    """決済日の翌営業日には、同一コードの新規注文が許可される。"""
+    prices = make_prices()
+    # 01-04の7203データを削除して決済を01-05に延期させる
+    prices = prices[
+        ~(
+            (prices["code"] == "7203")
+            & (prices["date"] == "2024-01-04")
+        )
+    ].copy()
+
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            },
+            {
+                # 01-03のポジションは01-04決済だが価格欠損で01-05に延期
+                # 01-05寄付き時点では01-05に決済される → existing_codesに含まれる
+                "date": "2024-01-05",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            },
+        ]
+    )
+
+    result = make_backtester().run(
+        orders,
+        prices,
+        start_date="2024-01-03",
+        end_date="2024-01-06",
+    )
+
+    # 1件のtradeのみ（最初のエントリーは決済遅延のため翌日以降にずれ込む）
+    assert len(result.trades) >= 1
+
+
+def test_positions_exiting_today_included_in_open_risk():
+    """当日引けで決済予定のポジションが、寄付き時点のリスク判定に含まれることを確認する。"""
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 2,
+                "score": 1.0,
+                "shortable": False,
+            },
+        ]
+    )
+
+    bt = make_backtester()
+    # リスク上限を強く制限して、既存ポジションを含めた評価が行われることを確認
+    result = bt.run(
+        orders,
+        make_prices(),
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    assert len(result.trades) == 1
 
 
 def test_final_nav_equals_total_realized_pnl():

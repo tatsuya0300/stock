@@ -13,7 +13,8 @@ import argparse
 import logging
 import sys
 import traceback
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from jp_signal.config import load_config
 from jp_signal.pipeline import closing_pipeline, make_notifier, morning_pipeline
@@ -62,7 +63,12 @@ if __name__ == "__main__":
     args = _parse_args()
     cfg = load_config(args.config)
     notifier = make_notifier(cfg)
-    as_of = date.fromisoformat(args.date) if args.date else date.today()
+    JST = ZoneInfo("Asia/Tokyo")
+
+    def today_in_japan() -> date:
+        return datetime.now(JST).date()
+
+    as_of = date.fromisoformat(args.date) if args.date else today_in_japan()
 
     try:
         if args.mode == "morning":

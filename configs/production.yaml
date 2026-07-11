@@ -32,6 +32,10 @@ sizing:
   adv_ratio_cap: 0.002
   adv_window: 20
   min_adv_periods: 20
+  # 本番では完全なADV履歴を必須にする
+  require_full_adv_history: true
+  # 単日turnoverへのfallbackは禁止
+  allow_single_day_turnover_fallback: false
   market_open_unit_cap: 50
   unit: 100
 
@@ -44,6 +48,8 @@ risk:
   require_both_sides: true
   max_net_exposure_yen: 5000000
   allow_short_without_confirmed_shortability: false
+  # shortabilityスナップショットの最大許容経過暦日数
+  shortability_max_age_days: 4
 
 notify:
   channel: "console"

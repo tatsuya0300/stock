@@ -242,6 +242,12 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
             unit=unit,
             order_type="MKT_OPEN",
             for_backtest=False,
+            shortability_max_age_days=int(
+                cfg.get("risk", {}).get(
+                    "shortability_max_age_days",
+                    4,
+                )
+            ),
         )
 
         if orders.empty:
