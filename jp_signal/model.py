@@ -40,19 +40,33 @@ class MeanReversionRule(SignalModel):
 
     def generate(self, prices: pd.DataFrame, as_of: str) -> pd.DataFrame:
         empty = pd.DataFrame(columns=["code", "side", "score", "limit_price"])
+
         if prices is None or prices.empty:
             return empty
+
+        required = {"code", "date"}
+        missing = required - set(prices.columns)
+        if missing:
+            raise ValueError(f"prices missing columns: {sorted(missing)}")
 
         as_of_d = pd.Timestamp(as_of).date()
         # 寄前想定: 当日終値は未確定のため使わない
         # 祝日・年末年始も calendar.previous_business_day で除外
-        cutoff_d = previous_business_day(as_of_d)
-        cutoff = cutoff_d.isoformat()
+        cutoff = pd.Timestamp(previous_business_day(as_of_d))
 
-        df = prices[prices["date"] <= cutoff].copy()
+        df = prices.copy()
+        df["date"] = pd.to_datetime(
+            df["date"],
+            errors="coerce",
+        ).dt.normalize()
+        df["code"] = df["code"].astype(str).str.strip()
+
+        df = df.dropna(subset=["date"])
+        df = df[df["date"] <= cutoff]
+
         if df.empty:
             return empty
-        df["date"] = pd.to_datetime(df["date"])
+
         df = df.sort_values(["code", "date"])
 
         # リターン計算は分割・配当調整済みの adj_close を使う。
