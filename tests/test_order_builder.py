@@ -81,9 +81,10 @@ def test_signals_to_orders_includes_name_for_live():
     assert "name" in orders.columns, "name column must exist"
     assert orders.iloc[0]["name"] == "トヨタ", f"expected トヨタ, got {orders.iloc[0]['name']}"
 
-    # for_backtest=False でも date/limit_price/holding_days が無いこと
-    assert "date" not in orders.columns or orders["date"].isna().all()
-    assert "limit_price" not in orders.columns or orders["limit_price"].isna().all()
+    # for_backtest=False では date/limit_price/holding_days が無いこと
+    assert "date" not in orders.columns
+    assert "limit_price" not in orders.columns
+    assert "holding_days" not in orders.columns
 
 
 def test_is_shortable_rejects_stale_snapshot():
@@ -203,3 +204,68 @@ def test_signals_to_orders_drops_unshortable_sell():
         shortability=None,
     )
     assert orders.empty or (orders["side"] != "SELL").all()
+
+
+def test_pit_shortability_does_not_use_observation_available_after_decision():
+    """判断時刻後に取得された観測を使用しない。"""
+    observations = pd.DataFrame(
+        [
+            {
+                "code": "7203",
+                "effective_at": "2024-01-11T07:00:00+09:00",
+                "fetched_at": "2024-01-11T09:00:00+09:00",
+                "source": "test",
+                "short_type": "system",
+                "is_shortable": 1,
+                "is_margin_lendable": 1,
+                "short_restricted": 0,
+                "stock_loan_fee_annual": None,
+            }
+        ]
+    )
+
+    # 09:00取得のデータは08:15判断時点では利用できない。
+    assert (
+        is_shortable_asof(
+            observations,
+            "7203",
+            pd.Timestamp(
+                "2024-01-11T08:15:00",
+                tz="Asia/Tokyo",
+            ),
+            max_age_calendar_days=4,
+        )
+        is False
+    )
+
+
+def test_pit_shortability_uses_observation_available_before_decision():
+    """判断時刻以前に利用可能だった観測を使用する。"""
+    observations = pd.DataFrame(
+        [
+            {
+                "code": "7203",
+                "effective_at": "2024-01-11T07:00:00+09:00",
+                "fetched_at": "2024-01-11T07:05:00+09:00",
+                "source": "test",
+                "short_type": "system",
+                "is_shortable": 1,
+                "is_margin_lendable": 1,
+                "short_restricted": 0,
+                "stock_loan_fee_annual": None,
+            }
+        ]
+    )
+
+    assert (
+        is_shortable_asof(
+            observations,
+            "7203",
+            pd.Timestamp(
+                "2024-01-11T08:15:00",
+                tz="Asia/Tokyo",
+            ),
+            max_age_calendar_days=4,
+        )
+        is True
+    )
