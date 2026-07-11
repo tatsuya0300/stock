@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date
 from pathlib import Path
+from typing import Any
 
 try:
     import yaml
@@ -45,6 +47,89 @@ _DEFAULT_BACKTEST = {
 
 class ConfigError(ValueError):
     """設定不備。"""
+
+
+def _resolve_path(
+    raw_path: str | None,
+    *,
+    config_path: Path,
+) -> str | None:
+    """相対パスをconfigファイルの配置場所基準で絶対パス化する。"""
+    if raw_path is None:
+        return None
+
+    value = str(raw_path).strip()
+    if not value:
+        return value
+
+    path = Path(value).expanduser()
+
+    if not path.is_absolute():
+        path = config_path.parent / path
+
+    return str(path.resolve())
+
+
+def _as_float(
+    mapping: dict[str, Any],
+    key: str,
+    *,
+    section: str,
+    default: float | None = None,
+) -> float:
+    raw = mapping.get(key, default)
+
+    if raw is None:
+        raise ConfigError(f"{section}.{key} が設定されていません")
+
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"{section}.{key} は数値である必要があります: {raw!r}"
+        ) from exc
+
+
+def _as_int(
+    mapping: dict[str, Any],
+    key: str,
+    *,
+    section: str,
+    default: int | None = None,
+) -> int:
+    raw = mapping.get(key, default)
+
+    if raw is None:
+        raise ConfigError(f"{section}.{key} が設定されていません")
+
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"{section}.{key} は整数である必要があります: {raw!r}"
+        ) from exc
+
+
+def _validate_non_negative(
+    mapping: dict[str, Any],
+    keys: list[str],
+    *,
+    section: str,
+) -> None:
+    for key in keys:
+        if key not in mapping:
+            continue
+
+        value = _as_float(
+            mapping,
+            key,
+            section=section,
+        )
+
+        if value < 0:
+            raise ConfigError(
+                f"{section}.{key} は負の値にできません: {value}"
+            )
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -112,6 +197,24 @@ def load_config(path: str = "config.yaml") -> dict:
                 "(V2 API Key) を設定してください。"
             )
 
+    # 相対パスをconfigファイルの配置場所基準で解決する
+    cfg["data"]["db_path"] = _resolve_path(
+        cfg["data"].get("db_path"),
+        config_path=p,
+    )
+
+    if "file" in cfg.get("universe", {}):
+        cfg["universe"]["file"] = _resolve_path(
+            cfg["universe"]["file"],
+            config_path=p,
+        )
+
+    if "output_dir" in cfg.get("backtest", {}):
+        cfg["backtest"]["output_dir"] = _resolve_path(
+            cfg["backtest"]["output_dir"],
+            config_path=p,
+        )
+
     # yfinance 近似ガード
     allow_approx = bool(cfg["data"].get("allow_approximate_turnover", False))
     if source == "yfinance" and not allow_approx:
@@ -133,32 +236,157 @@ def load_config(path: str = "config.yaml") -> dict:
             "  推奨列: code,name[,effective_from,effective_to]"
         )
 
-    # sizing のバリデーション
-    sizing = cfg.get("sizing", {})
-    adv_ratio = float(sizing.get("adv_ratio", 0.001))
-    adv_ratio_cap = float(sizing.get("adv_ratio_cap", 0.002))
+    _validate_config_values(cfg)
+
+    return cfg
+
+
+def _validate_config_values(cfg: dict) -> None:
+    """実行前に設定値の意味的整合性を検証する。"""
+    backtest = cfg["backtest"]
+    sizing = cfg["sizing"]
+    risk = cfg.get("risk", {})
+    model = cfg.get("model", {})
+    data_quality = cfg.get("data_quality", {})
+
+    if "start" in backtest and "end" in backtest:
+        try:
+            start = date.fromisoformat(str(backtest["start"]))
+            end = date.fromisoformat(str(backtest["end"]))
+        except ValueError as exc:
+            raise ConfigError(
+                "backtest.start/end はYYYY-MM-DD形式である必要があります"
+            ) from exc
+
+        if start > end:
+            raise ConfigError(
+                f"backtest.startはend以前である必要があります: "
+                f"{start} > {end}"
+            )
+
+    _validate_non_negative(
+        backtest,
+        [
+            "impact_k_bp",
+            "annual_interest_rate",
+            "short_lending_rate",
+            "commission_bp",
+            "half_spread_bp",
+            "risk_free_rate",
+        ],
+        section="backtest",
+    )
+
+    initial_capital = _as_float(
+        backtest,
+        "initial_capital",
+        section="backtest",
+        default=100_000_000,
+    )
+    if initial_capital <= 0:
+        raise ConfigError(
+            f"backtest.initial_capital は正の値である必要があります: "
+            f"{initial_capital}"
+        )
+
+    _validate_non_negative(
+        sizing,
+        ["adv_ratio", "adv_ratio_cap"],
+        section="sizing",
+    )
+
+    adv_ratio = _as_float(
+        sizing,
+        "adv_ratio",
+        section="sizing",
+        default=0.001,
+    )
+    adv_ratio_cap = _as_float(
+        sizing,
+        "adv_ratio_cap",
+        section="sizing",
+        default=0.002,
+    )
     if adv_ratio > adv_ratio_cap:
         raise ConfigError(
             f"sizing.adv_ratio ({adv_ratio}) が "
             f"sizing.adv_ratio_cap ({adv_ratio_cap}) を超えています"
         )
 
-    # adv_window vs min_adv_periods バリデーション
-    bt_min_adv = int(sizing.get("min_adv_periods", 1))
-    bt_adv_win = int(sizing.get("adv_window", 20))
-    if bt_min_adv > bt_adv_win:
+    sizing_adv_window = _as_int(
+        sizing,
+        "adv_window",
+        section="sizing",
+        default=20,
+    )
+    sizing_min_periods = _as_int(
+        sizing,
+        "min_adv_periods",
+        section="sizing",
+        default=1,
+    )
+
+    if sizing_adv_window < sizing_min_periods:
         raise ConfigError(
-            f"sizing.min_adv_periods ({bt_min_adv}) が "
-            f"sizing.adv_window ({bt_adv_win}) を超えています"
+            f"sizing.adv_window ({sizing_adv_window}) が "
+            f"sizing.min_adv_periods ({sizing_min_periods}) 未満です"
         )
 
-    bt_min_adv_bt = int(cfg.get("backtest", {}).get("min_adv_periods", 20))
-    bt_adv_win_bt = int(cfg.get("backtest", {}).get("adv_window", 20))
-    if bt_min_adv_bt > bt_adv_win_bt:
+    # backtest 専用の adv_window/min_adv_periods
+    bt_adv_window = _as_int(
+        backtest,
+        "adv_window",
+        section="backtest",
+        default=sizing_adv_window,
+    )
+    bt_min_periods = _as_int(
+        backtest,
+        "min_adv_periods",
+        section="backtest",
+        default=sizing_min_periods,
+    )
+
+    if bt_adv_window < bt_min_periods:
         raise ConfigError(
-            f"backtest.min_adv_periods ({bt_min_adv_bt}) が "
-            f"backtest.adv_window ({bt_adv_win_bt}) を超えています"
+            f"backtest.adv_window ({bt_adv_window}) が "
+            f"backtest.min_adv_periods ({bt_min_periods}) 未満です"
         )
+
+    max_single_name = _as_float(
+        risk,
+        "max_single_name_exposure_yen",
+        section="risk",
+        default=20_000_000,
+    )
+    max_gross = _as_float(
+        risk,
+        "max_gross_exposure_yen",
+        section="risk",
+        default=100_000_000,
+    )
+
+    if max_single_name > max_gross:
+        raise ConfigError(
+            "risk.max_single_name_exposure_yen は"
+            "max_gross_exposure_yen以下である必要があります"
+        )
+
+    for key in [
+        "price_coverage_min",
+        "lookback_coverage_min",
+        "turnover_coverage_min",
+    ]:
+        if key not in data_quality:
+            continue
+        value = _as_float(
+            data_quality,
+            key,
+            section="data_quality",
+        )
+        if not 0 < value <= 1.0:
+            raise ConfigError(
+                f"data_quality.{key} は0〜1の範囲である必要があります: {value}"
+            )
 
     # notify.channel のバリデーション
     valid_channels = {"console", "discord"}
@@ -174,7 +402,7 @@ def load_config(path: str = "config.yaml") -> dict:
                 "環境変数 DISCORD_WEBHOOK が必要です"
             )
 
-    # shortability 運用ルール: 本番で売りを許可する設定は明示ログ
+    # shortability 運用ルール
     if cfg["risk"].get("allow_short_without_confirmed_shortability", False):
         log.warning(
             "risk.allow_short_without_confirmed_shortability=true: "
@@ -189,7 +417,17 @@ def load_config(path: str = "config.yaml") -> dict:
     if not cfg["backtest"].get("impact_k_is_calibrated", False):
         log.info("backtest.impact_k_is_calibrated=false: impact_k_bp は未較正です。")
 
-    return cfg
+    # モデル validation（存在する場合のみ）
+    if "lookback" in model:
+        lookback = _as_int(
+            model,
+            "lookback",
+            section="model",
+        )
+        if lookback < 1:
+            raise ConfigError(
+                f"model.lookback は1以上である必要があります: {lookback}"
+            )
 
 
 def uses_approximate_turnover(cfg: dict) -> bool:

@@ -1,10 +1,10 @@
 data:
   source: "yfinance"
-  db_path: "./data/jp_signal_demo.sqlite"
+  db_path: "../data/jp_signal_demo.sqlite"
   allow_approximate_turnover: true
 
 universe:
-  file: "./data/topix500_sample.csv"
+  file: "../data/topix500_sample.csv"
 
 model:
   lookback: 5
@@ -21,7 +21,7 @@ backtest:
   holding_days: 1
   commission_bp: 0.0
   half_spread_bp: 0.0
-  output_dir: "./data/bt_out_demo"
+  output_dir: "../data/bt_out_demo"
   allow_unconfirmed_short_in_bt: true
   initial_capital: 100000000
   risk_free_rate: 0.0
