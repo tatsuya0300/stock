@@ -85,9 +85,7 @@ def _as_float(
     try:
         return float(raw)
     except (TypeError, ValueError) as exc:
-        raise ConfigError(
-            f"{section}.{key} は数値である必要があります: {raw!r}"
-        ) from exc
+        raise ConfigError(f"{section}.{key} は数値である必要があります: {raw!r}") from exc
 
 
 def _as_int(
@@ -105,9 +103,7 @@ def _as_int(
     try:
         return int(raw)
     except (TypeError, ValueError) as exc:
-        raise ConfigError(
-            f"{section}.{key} は整数である必要があります: {raw!r}"
-        ) from exc
+        raise ConfigError(f"{section}.{key} は整数である必要があります: {raw!r}") from exc
 
 
 def _validate_non_negative(
@@ -127,9 +123,7 @@ def _validate_non_negative(
         )
 
         if value < 0:
-            raise ConfigError(
-                f"{section}.{key} は負の値にできません: {value}"
-            )
+            raise ConfigError(f"{section}.{key} は負の値にできません: {value}")
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -254,15 +248,10 @@ def _validate_config_values(cfg: dict) -> None:
             start = date.fromisoformat(str(backtest["start"]))
             end = date.fromisoformat(str(backtest["end"]))
         except ValueError as exc:
-            raise ConfigError(
-                "backtest.start/end はYYYY-MM-DD形式である必要があります"
-            ) from exc
+            raise ConfigError("backtest.start/end はYYYY-MM-DD形式である必要があります") from exc
 
         if start > end:
-            raise ConfigError(
-                f"backtest.startはend以前である必要があります: "
-                f"{start} > {end}"
-            )
+            raise ConfigError(f"backtest.startはend以前である必要があります: {start} > {end}")
 
     _validate_non_negative(
         backtest,
@@ -285,8 +274,7 @@ def _validate_config_values(cfg: dict) -> None:
     )
     if initial_capital <= 0:
         raise ConfigError(
-            f"backtest.initial_capital は正の値である必要があります: "
-            f"{initial_capital}"
+            f"backtest.initial_capital は正の値である必要があります: {initial_capital}"
         )
 
     _validate_non_negative(
@@ -311,6 +299,18 @@ def _validate_config_values(cfg: dict) -> None:
         raise ConfigError(
             f"sizing.adv_ratio ({adv_ratio}) が "
             f"sizing.adv_ratio_cap ({adv_ratio_cap}) を超えています"
+        )
+
+    reference_price_buffer_ratio = _as_float(
+        sizing,
+        "reference_price_buffer_ratio",
+        section="sizing",
+        default=0.0,
+    )
+    if not 0 <= reference_price_buffer_ratio <= 1.0:
+        raise ConfigError(
+            f"sizing.reference_price_buffer_ratio "
+            f"({reference_price_buffer_ratio}) は0〜1の範囲である必要があります"
         )
 
     sizing_adv_window = _as_int(
@@ -367,8 +367,7 @@ def _validate_config_values(cfg: dict) -> None:
 
     if max_single_name > max_gross:
         raise ConfigError(
-            "risk.max_single_name_exposure_yen は"
-            "max_gross_exposure_yen以下である必要があります"
+            "risk.max_single_name_exposure_yen はmax_gross_exposure_yen以下である必要があります"
         )
 
     for key in [
@@ -384,9 +383,7 @@ def _validate_config_values(cfg: dict) -> None:
             section="data_quality",
         )
         if not 0 < value <= 1.0:
-            raise ConfigError(
-                f"data_quality.{key} は0〜1の範囲である必要があります: {value}"
-            )
+            raise ConfigError(f"data_quality.{key} は0〜1の範囲である必要があります: {value}")
 
     # notify.channel のバリデーション
     valid_channels = {"console", "discord"}
@@ -425,9 +422,7 @@ def _validate_config_values(cfg: dict) -> None:
             section="model",
         )
         if lookback < 1:
-            raise ConfigError(
-                f"model.lookback は1以上である必要があります: {lookback}"
-            )
+            raise ConfigError(f"model.lookback は1以上である必要があります: {lookback}")
 
 
 def uses_approximate_turnover(cfg: dict) -> bool:

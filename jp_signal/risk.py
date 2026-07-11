@@ -150,6 +150,7 @@ def select_orders_with_reasons(
         code = str(row.get("code", "")).strip()
         side = str(row["side"])
         value = float(row["value_yen"])
+        risk_value = float(row.get("risk_value_yen", value))
 
         if not code:
             reject(row, "EMPTY_CODE")
@@ -167,7 +168,7 @@ def select_orders_with_reasons(
             reject(row, "INVALID_VALUE_YEN")
             continue
 
-        if value > risk.max_single_name_exposure_yen:
+        if risk_value > risk.max_single_name_exposure_yen:
             reject(row, "SINGLE_NAME_LIMIT")
             continue
 
@@ -256,6 +257,7 @@ def select_orders_with_reasons(
         code = str(row["code"])
         side = str(row["side"])
         value = float(row["value_yen"])
+        risk_value = float(row.get("risk_value_yen", value))
 
         if len(selected_rows) >= risk.max_orders_per_day:
             reject(row, "DAILY_ORDER_LIMIT")
@@ -265,9 +267,9 @@ def select_orders_with_reasons(
         next_short = short_value
 
         if side == "BUY":
-            next_long += value
+            next_long += risk_value
         else:
-            next_short += value
+            next_short += risk_value
 
         next_gross = next_long + next_short
 
@@ -310,12 +312,12 @@ def select_orders_with_reasons(
         )
 
         selected_rows.remove(weakest)
-        value = float(weakest["value_yen"])
+        risk_value = float(weakest.get("risk_value_yen", weakest["value_yen"]))
 
         if weakest["side"] == "BUY":
-            long_value -= value
+            long_value -= risk_value
         else:
-            short_value -= value
+            short_value -= risk_value
 
         reject(weakest, "NET_LIMIT")
 
