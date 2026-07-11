@@ -1,0 +1,4 @@
+code,effective_at,fetched_at,source,short_type,is_shortable,is_margin_lendable,short_restricted,stock_loan_fee_annual
+7203,2026-07-10T07:00:00+09:00,2026-07-10T07:05:00+09:00,manual_jsf,system,1,1,0,
+6758,2026-07-10T07:00:00+09:00,2026-07-10T07:05:00+09:00,manual_jsf,system,0,1,1,
+9984,2026-07-10T07:00:00+09:00,2026-07-10T07:05:00+09:00,broker_csv,general,1,,0,0.015

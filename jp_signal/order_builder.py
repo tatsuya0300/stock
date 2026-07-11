@@ -20,6 +20,9 @@ from .risk import (
     RiskSelectionResult,
     select_orders_with_reasons,
 )
+from .shortability_pit import (
+    decide_shortability,
+)
 from .sizing import compute_size
 
 
@@ -47,6 +50,31 @@ def is_shortable_asof(
     if shortability is None or shortability.empty:
         return False
 
+    # PITカラムが存在する場合、PIT実装を優先する
+    pit_columns = {
+        "effective_at",
+        "fetched_at",
+        "source",
+        "short_type",
+        "is_shortable",
+        "short_restricted",
+    }
+
+    if pit_columns.issubset(
+        shortability.columns
+    ):
+        decision = decide_shortability(
+            shortability,
+            code=code,
+            as_of=as_of,
+            requested_short_type="system",
+            max_age=pd.Timedelta(
+                days=max_age_calendar_days
+            ),
+        )
+        return decision.is_shortable
+
+    # 以下は既存legacy実装
     required = {
         "code",
         "date",
@@ -180,6 +208,7 @@ def build_orders_with_audit(
     unit: int = 100,
     for_backtest: bool = False,
     shortability_max_age_days: int = 4,
+    decision_at: str | pd.Timestamp | None = None,
 ) -> OrderBuildResult:
     """シグナルを注文へ変換し、採用・不採用を全て返す。"""
     if signals is None or signals.empty:
@@ -325,10 +354,16 @@ def build_orders_with_audit(
             _reject(signal, stage="SIZING", reason="QTY_ZERO")
             continue
 
+        shortability_as_of = (
+            decision_at
+            if decision_at is not None
+            else as_of_d
+        )
+
         shortable = is_shortable_asof(
             shortability,
             code,
-            as_of_d,
+            shortability_as_of,
             max_age_calendar_days=shortability_max_age_days,
         )
 
@@ -419,6 +454,7 @@ def signals_to_orders(
     unit: int = 100,
     for_backtest: bool = False,
     shortability_max_age_days: int = 4,
+    decision_at: str | pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """後方互換API。監査情報が必要ならbuild_orders_with_auditを使用する。"""
     result = build_orders_with_audit(
@@ -434,6 +470,7 @@ def signals_to_orders(
         unit=unit,
         for_backtest=for_backtest,
         shortability_max_age_days=shortability_max_age_days,
+        decision_at=decision_at,
     )
     return result.selected
 
