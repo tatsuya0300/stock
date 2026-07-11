@@ -32,6 +32,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
+from .corporate_actions import CorporateAction, _apply_corporate_actions
 from .risk import RiskConfig
 
 Side = Literal["BUY", "SELL"]
@@ -551,6 +552,16 @@ class PortfolioBacktester:
     # main run
     # ----------------------------------------------------------------
 
+    @staticmethod
+    def _group_corporate_actions(
+        actions: list[CorporateAction],
+    ) -> dict[str, list[CorporateAction]]:
+        """コーポレートアクションを ex_date でグループ化する。"""
+        grouped: dict[str, list[CorporateAction]] = {}
+        for a in actions:
+            grouped.setdefault(a.ex_date, []).append(a)
+        return grouped
+
     def run(
         self,
         orders: pd.DataFrame,
@@ -558,6 +569,7 @@ class PortfolioBacktester:
         *,
         start_date: str | None = None,
         end_date: str | None = None,
+        corporate_actions: list[CorporateAction] | None = None,
     ) -> PortfolioResult:
         if orders is None or orders.empty:
             empty = pd.DataFrame()
@@ -610,7 +622,19 @@ class PortfolioBacktester:
         daily_ledger: list[dict] = []
         position_sequence = 0
 
+        ca_grouped = self._group_corporate_actions(corporate_actions) if corporate_actions else {}
+
         for date in trading_dates:
+            date_str = str(date.date())
+
+            # --- 0. apply corporate actions ---
+            day_ca = ca_grouped.get(date_str, [])
+            if day_ca:
+                positions, cash = _apply_corporate_actions(
+                    positions, day_ca, date_str, cash,
+                    ledger=daily_ledger,
+                )
+
             # --- 1. accrue carry on existing positions ---
             positions = self._accrue_carry(
                 positions,
