@@ -38,6 +38,21 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _decision_at_jst(day: str, cfg: dict) -> pd.Timestamp:
+    """バックテスト日の寄前判断時刻をJSTで返す。"""
+    morning_time = str(
+        cfg.get("notify", {}).get(
+            "morning_time",
+            "08:15",
+        )
+    )
+
+    return pd.Timestamp(
+        f"{day} {morning_time}",
+        tz="Asia/Tokyo",
+    )
+
+
 def _json_safe_summary(summary: dict) -> dict:
     return {
         key: value for key, value in summary.items() if key not in {"daily_returns", "equity_curve"}
@@ -81,6 +96,12 @@ def main() -> None:
         )
     )
     holding_days = int(cfg["backtest"].get("holding_days", 1))
+    shortability_max_age_days = int(
+        cfg.get("risk", {}).get(
+            "shortability_max_age_days",
+            4,
+        )
+    )
 
     warmup_days = max(lookback + 1, adv_window, min_adv_periods) * 3
     load_start = bt_start - timedelta(days=warmup_days)
@@ -94,10 +115,23 @@ def main() -> None:
             load_start.isoformat(),
             bt_end.isoformat(),
         )
-        shortability = storage.load_shortability(
+        # 判断時点までに実際に利用可能だったPIT観測だけを取得する。
+        # legacy shortabilityには取得時刻がないため、推奨BTでは使用しない。
+        shortability = storage.load_shortability_observations(
             codes,
-            load_start.isoformat(),
-            bt_end.isoformat(),
+            available_before=_decision_at_jst(
+                bt_end.isoformat(),
+                cfg,
+            ),
+            available_after=(
+                _decision_at_jst(
+                    load_start.isoformat(),
+                    cfg,
+                )
+                - pd.Timedelta(
+                    days=shortability_max_age_days,
+                )
+            ),
         )
 
     if prices.empty:
@@ -148,6 +182,10 @@ def main() -> None:
             sig,
             px_d,
             as_of=d,
+            decision_at=_decision_at_jst(
+                d,
+                cfg,
+            ),
             sizing_cfg=cfg["sizing"],
             risk_cfg=risk_cfg,
             shortability=shortability if not shortability.empty else None,
@@ -156,12 +194,7 @@ def main() -> None:
             order_type="MKT_OPEN",
             unit=int(cfg.get("sizing", {}).get("unit", 100)),
             for_backtest=True,
-            shortability_max_age_days=int(
-                cfg.get("risk", {}).get(
-                    "shortability_max_age_days",
-                    4,
-                )
-            ),
+            shortability_max_age_days=shortability_max_age_days,
         )
         if not day_orders.empty:
             all_order_frames.append(day_orders)
