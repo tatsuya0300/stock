@@ -11,6 +11,7 @@ schema v3:
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from pathlib import Path
 
@@ -27,6 +28,7 @@ def _sha256_file(path: str | Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
 
 PRICE_COLS = [
     "code",
@@ -116,6 +118,29 @@ CREATE TABLE IF NOT EXISTS fills (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(source_file_hash, source_row_number)
 );
+
+CREATE TABLE IF NOT EXISTS order_rejections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    rejection_date TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    code TEXT,
+    name TEXT,
+    side TEXT,
+    score REAL,
+    qty INTEGER,
+    ref_price REAL,
+    value_yen REAL,
+    payload_json TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_rejections_date
+ON order_rejections(rejection_date);
+
+CREATE INDEX IF NOT EXISTS idx_order_rejections_run
+ON order_rejections(run_id);
 """
 
 
@@ -421,7 +446,7 @@ class Storage:
         ]
         if order_date:
             q = f"""
-            SELECT {', '.join(cols)}
+            SELECT {", ".join(cols)}
             FROM orders
             WHERE order_date = ?
             ORDER BY code, side
@@ -430,7 +455,7 @@ class Storage:
 
         if start and end:
             q = f"""
-            SELECT {', '.join(cols)}
+            SELECT {", ".join(cols)}
             FROM orders
             WHERE order_date BETWEEN ? AND ?
             ORDER BY order_date, code, side
@@ -461,7 +486,7 @@ class Storage:
         ]
         if trade_date:
             q = f"""
-            SELECT {', '.join(cols)}
+            SELECT {", ".join(cols)}
             FROM fills
             WHERE trade_date = ?
             ORDER BY code, side
@@ -469,7 +494,7 @@ class Storage:
             return pd.read_sql(q, self.conn, params=[trade_date])
         if start and end:
             q = f"""
-            SELECT {', '.join(cols)}
+            SELECT {", ".join(cols)}
             FROM fills
             WHERE trade_date BETWEEN ? AND ?
             ORDER BY trade_date, code
@@ -534,6 +559,64 @@ class Storage:
                 n += int(cur.rowcount)
 
         return n
+
+    def append_order_rejections(
+        self,
+        *,
+        run_id: str,
+        rejection_date: str,
+        rejected: pd.DataFrame,
+    ) -> None:
+        if rejected is None or rejected.empty:
+            return
+
+        sql = """
+        INSERT INTO order_rejections (
+            run_id,
+            rejection_date,
+            stage,
+            reason,
+            code,
+            name,
+            side,
+            score,
+            qty,
+            ref_price,
+            value_yen,
+            payload_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        records = []
+
+        for _, row in rejected.iterrows():
+            payload = {
+                str(key): (
+                    None if pd.isna(value) else value.item() if hasattr(value, "item") else value
+                )
+                for key, value in row.to_dict().items()
+            }
+
+            records.append(
+                (
+                    run_id,
+                    rejection_date,
+                    str(row.get("stage", "UNKNOWN")),
+                    str(row.get("reason", "UNKNOWN")),
+                    str(row.get("code", "")) if pd.notna(row.get("code")) else "",
+                    str(row.get("name", "")) if pd.notna(row.get("name")) else "",
+                    str(row.get("side", "")) if pd.notna(row.get("side")) else "",
+                    (None if pd.isna(row.get("score")) else float(row["score"])),
+                    (None if pd.isna(row.get("qty")) else int(row["qty"])),
+                    (None if pd.isna(row.get("ref_price")) else float(row["ref_price"])),
+                    (None if pd.isna(row.get("value_yen")) else float(row["value_yen"])),
+                    json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True),
+                )
+            )
+
+        with self.conn:
+            self.conn.executemany(sql, records)
 
     def close(self) -> None:
         self.conn.close()

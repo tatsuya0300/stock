@@ -6,7 +6,9 @@ live pipeline と backtest が同一ロジックを通ることで
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -16,7 +18,6 @@ from .calendar import previous_business_day
 from .risk import (
     RiskConfig,
     RiskSelectionResult,
-    apply_order_risk_limits,
     select_orders_with_reasons,
 )
 from .sizing import compute_size
@@ -99,6 +100,311 @@ def _ref_rows_before(prices: pd.DataFrame, as_of: date | str) -> pd.DataFrame:
     return prev.groupby("code").tail(1).set_index("code")
 
 
+_ORDER_COLUMNS = [
+    "code",
+    "name",
+    "side",
+    "order_type",
+    "qty",
+    "ref_price",
+    "value_yen",
+    "score",
+    "warn",
+    "shortable",
+    "date",
+    "limit_price",
+    "holding_days",
+]
+
+
+@dataclass(frozen=True)
+class OrderBuildResult:
+    selected: pd.DataFrame
+    rejected: pd.DataFrame
+    diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RejectionRecord:
+    stage: str
+    reason: str
+    code: str
+    side: str
+    score: float | None = None
+    qty: int | None = None
+    ref_price: float | None = None
+    value_yen: float | None = None
+    name: str = ""
+    warn: str = ""
+    shortable: bool | None = None
+
+
+_REJECTION_COLUMNS = [
+    "code",
+    "name",
+    "side",
+    "order_type",
+    "qty",
+    "ref_price",
+    "value_yen",
+    "score",
+    "warn",
+    "shortable",
+    "date",
+    "limit_price",
+    "holding_days",
+    "stage",
+    "reason",
+]
+
+
+def _empty_orders() -> pd.DataFrame:
+    return pd.DataFrame(columns=_ORDER_COLUMNS)
+
+
+def _empty_rejections() -> pd.DataFrame:
+    return pd.DataFrame(columns=_REJECTION_COLUMNS)
+
+
+def build_orders_with_audit(
+    signals: pd.DataFrame,
+    prices: pd.DataFrame,
+    *,
+    as_of: date | str,
+    sizing_cfg: dict,
+    risk_cfg: RiskConfig,
+    shortability: pd.DataFrame | None = None,
+    universe: pd.DataFrame | None = None,
+    holding_days: int = 1,
+    order_type: str = "MKT_OPEN",
+    unit: int = 100,
+    for_backtest: bool = False,
+    shortability_max_age_days: int = 4,
+) -> OrderBuildResult:
+    """シグナルを注文へ変換し、採用・不採用を全て返す。"""
+    if signals is None or signals.empty:
+        return OrderBuildResult(
+            selected=_empty_orders(),
+            rejected=_empty_rejections(),
+            diagnostics={
+                "signal_count": 0,
+                "candidate_count": 0,
+                "selected_count": 0,
+                "rejected_count": 0,
+            },
+        )
+
+    if prices is None or prices.empty:
+        rejected = signals.copy()
+        rejected["stage"] = "REFERENCE_DATA"
+        rejected["reason"] = "EMPTY_PRICES"
+        for col in _REJECTION_COLUMNS:
+            if col not in rejected.columns:
+                rejected[col] = None
+        return OrderBuildResult(
+            selected=_empty_orders(),
+            rejected=rejected[_REJECTION_COLUMNS],
+            diagnostics={
+                "signal_count": len(signals),
+                "candidate_count": 0,
+                "selected_count": 0,
+                "rejected_count": len(rejected),
+            },
+        )
+
+    last_row = _ref_rows_before(prices, as_of)
+
+    if last_row.empty:
+        rejected = signals.copy()
+        rejected["stage"] = "REFERENCE_DATA"
+        rejected["reason"] = "NO_REFERENCE_DATE"
+        for col in _REJECTION_COLUMNS:
+            if col not in rejected.columns:
+                rejected[col] = None
+        return OrderBuildResult(
+            selected=_empty_orders(),
+            rejected=rejected[_REJECTION_COLUMNS],
+            diagnostics={
+                "signal_count": len(signals),
+                "candidate_count": 0,
+                "selected_count": 0,
+                "rejected_count": len(rejected),
+            },
+        )
+
+    adv_window = int(sizing_cfg.get("adv_window", 20))
+    min_adv_periods = int(sizing_cfg.get("min_adv_periods", 1))
+    require_full_adv_history = bool(sizing_cfg.get("require_full_adv_history", True))
+    allow_single_day_turnover_fallback = bool(
+        sizing_cfg.get("allow_single_day_turnover_fallback", False)
+    )
+
+    adv_series = rolling_adv_before(
+        prices,
+        as_of,
+        window=adv_window,
+        min_periods=min_adv_periods,
+        strictly_before=True,
+    )
+
+    univ_idx: pd.DataFrame | None = None
+    if universe is not None and not universe.empty:
+        univ_idx = universe.set_index("code")
+
+    as_of_d = pd.Timestamp(as_of).date()
+
+    candidate_rows: list[dict] = []
+    rejected_rows: list[dict] = []
+
+    def _reject(
+        signal: pd.Series,
+        *,
+        stage: str,
+        reason: str,
+    ) -> None:
+        row = signal.to_dict()
+        # 欠損列を埋める
+        for col in _REJECTION_COLUMNS:
+            if col not in row:
+                row[col] = None
+        row["stage"] = stage
+        row["reason"] = reason
+        rejected_rows.append(row)
+
+    for _, signal in signals.iterrows():
+        code = str(signal.get("code", "")).strip()
+        side = str(signal.get("side", "")).upper()
+
+        if not code:
+            _reject(signal, stage="VALIDATION", reason="EMPTY_CODE")
+            continue
+
+        if side not in {"BUY", "SELL"}:
+            _reject(signal, stage="VALIDATION", reason="INVALID_SIDE")
+            continue
+
+        if code not in last_row.index:
+            _reject(signal, stage="REFERENCE_DATA", reason="NO_REFERENCE_PRICE")
+            continue
+
+        ref = float(pd.to_numeric(last_row.loc[code, "close"], errors="coerce"))
+
+        if not np.isfinite(ref) or ref <= 0:
+            _reject(signal, stage="REFERENCE_DATA", reason="INVALID_REFERENCE_PRICE")
+            continue
+
+        adv = float(adv_series.get(code, float("nan")))
+        adv_stage = "ADV"
+
+        if not np.isfinite(adv) or adv <= 0:
+            if require_full_adv_history:
+                _reject(signal, stage=adv_stage, reason="ADV_UNAVAILABLE")
+                continue
+            if allow_single_day_turnover_fallback:
+                adv = float(
+                    pd.to_numeric(
+                        last_row.loc[code, "turnover"],
+                        errors="coerce",
+                    )
+                )
+                if not np.isfinite(adv) or adv <= 0:
+                    _reject(signal, stage=adv_stage, reason="ADV_FALLBACK_ZERO")
+                    continue
+
+        qty, yen, warn = compute_size(
+            adv,
+            ref,
+            float(sizing_cfg["adv_ratio"]),
+            float(sizing_cfg["adv_ratio_cap"]),
+            unit=unit,
+            market_open_unit_cap=int(sizing_cfg.get("market_open_unit_cap", 50)),
+            is_market_open_order=(order_type == "MKT_OPEN"),
+        )
+
+        if qty == 0:
+            _reject(signal, stage="SIZING", reason="QTY_ZERO")
+            continue
+
+        shortable = is_shortable_asof(
+            shortability,
+            code,
+            as_of_d,
+            max_age_calendar_days=shortability_max_age_days,
+        )
+
+        name = ""
+        if univ_idx is not None and code in univ_idx.index:
+            name = str(univ_idx.loc[code, "name"])
+
+        candidate_row: dict = {
+            "code": code,
+            "name": name,
+            "side": side,
+            "order_type": order_type,
+            "qty": qty,
+            "ref_price": ref,
+            "value_yen": yen,
+            "score": float(signal.get("score", 0)),
+            "warn": warn,
+            "shortable": shortable,
+        }
+
+        if for_backtest:
+            candidate_row["date"] = str(as_of_d)
+            candidate_row["limit_price"] = signal.get("limit_price", None)
+            candidate_row["holding_days"] = holding_days
+
+        candidate_rows.append(candidate_row)
+
+    if not candidate_rows:
+        return OrderBuildResult(
+            selected=_empty_orders(),
+            rejected=pd.DataFrame(rejected_rows) if rejected_rows else _empty_rejections(),
+            diagnostics={
+                "signal_count": len(signals),
+                "candidate_count": 0,
+                "selected_count": 0,
+                "rejected_count": len(rejected_rows),
+            },
+        )
+
+    orders_df = pd.DataFrame(candidate_rows)
+
+    # リスク制限
+    risk_result = select_orders_with_reasons(
+        orders_df,
+        risk_cfg,
+        score_col="score",
+    )
+
+    selected = risk_result.selected
+    for _, rejected_candidate in risk_result.rejected.iterrows():
+        rec = rejected_candidate.to_dict()
+        for col in _REJECTION_COLUMNS:
+            if col not in rec:
+                rec[col] = None
+        rec["stage"] = "RISK_LIMIT"
+        rec["reason"] = str(rejected_candidate.get("reason", "RISK_REJECTED"))
+        rejected_rows.append(rec)
+
+    # 列を統一して返す
+    selected_out = selected[_ORDER_COLUMNS] if not selected.empty else _empty_orders()
+    rejected_out = (
+        pd.DataFrame(rejected_rows)[_REJECTION_COLUMNS] if rejected_rows else _empty_rejections()
+    )
+
+    return OrderBuildResult(
+        selected=selected_out,
+        rejected=rejected_out,
+        diagnostics={
+            "signal_count": len(signals),
+            "candidate_count": len(candidate_rows),
+            "selected_count": len(selected),
+            "rejected_count": len(rejected_rows),
+        },
+    )
+
+
 def signals_to_orders(
     signals: pd.DataFrame,
     prices: pd.DataFrame,
@@ -114,131 +420,22 @@ def signals_to_orders(
     for_backtest: bool = False,
     shortability_max_age_days: int = 4,
 ) -> pd.DataFrame:
-    """シグナル DataFrame をリスク制限後の orders に変換する。
-
-    Returns columns (最低限):
-      code, side, qty, order_type, value_yen, score, shortable, ref_price
-      (+ name, warn, date, limit_price, holding_days when for_backtest)
-    """
-    empty_cols = [
-        "code",
-        "name",
-        "side",
-        "order_type",
-        "qty",
-        "ref_price",
-        "value_yen",
-        "score",
-        "warn",
-        "shortable",
-        "date",
-        "limit_price",
-        "holding_days",
-    ]
-    if signals is None or signals.empty or prices is None or prices.empty:
-        return pd.DataFrame(columns=empty_cols)
-
-    last_row = _ref_rows_before(prices, as_of)
-    if last_row.empty:
-        return pd.DataFrame(columns=empty_cols)
-
-    adv_window = int(sizing_cfg.get("adv_window", 20))
-    min_adv_periods = int(sizing_cfg.get("min_adv_periods", 1))
-    require_full_adv_history = bool(
-        sizing_cfg.get(
-            "require_full_adv_history",
-            True,
-        )
-    )
-    allow_single_day_turnover_fallback = bool(
-        sizing_cfg.get(
-            "allow_single_day_turnover_fallback",
-            False,
-        )
-    )
-
-    adv_series = rolling_adv_before(
+    """後方互換API。監査情報が必要ならbuild_orders_with_auditを使用する。"""
+    result = build_orders_with_audit(
+        signals,
         prices,
-        as_of,
-        window=adv_window,
-        min_periods=min_adv_periods,
-        strictly_before=True,
+        as_of=as_of,
+        sizing_cfg=sizing_cfg,
+        risk_cfg=risk_cfg,
+        shortability=shortability,
+        universe=universe,
+        holding_days=holding_days,
+        order_type=order_type,
+        unit=unit,
+        for_backtest=for_backtest,
+        shortability_max_age_days=shortability_max_age_days,
     )
-
-    univ_idx = None
-    if universe is not None and not universe.empty:
-        univ_idx = universe.set_index("code")
-
-    as_of_d = pd.Timestamp(as_of).date()
-    rows: list[dict] = []
-
-    for _, r in signals.iterrows():
-        code = str(r["code"])
-        if code not in last_row.index:
-            continue
-
-        ref = float(last_row.loc[code, "close"])
-        adv = float(adv_series.get(code, float("nan")))
-
-        if not np.isfinite(adv) or adv <= 0:
-            if require_full_adv_history:
-                continue
-            if allow_single_day_turnover_fallback:
-                adv = float(last_row.loc[code, "turnover"])
-        qty, yen, warn = compute_size(
-            adv,
-            ref,
-            float(sizing_cfg["adv_ratio"]),
-            float(sizing_cfg["adv_ratio_cap"]),
-            unit=unit,
-            market_open_unit_cap=int(sizing_cfg.get("market_open_unit_cap", 50)),
-            is_market_open_order=(order_type == "MKT_OPEN"),
-        )
-        if qty == 0:
-            continue
-
-        shortable = is_shortable_asof(
-            shortability,
-            code,
-            as_of_d,
-            max_age_calendar_days=shortability_max_age_days,
-        )
-
-        name = ""
-        if univ_idx is not None and code in univ_idx.index:
-            name = str(univ_idx.loc[code, "name"])
-
-        # name は live/BT 共通で常に付与（通知・DB用）
-        row: dict = {
-            "code": code,
-            "name": name,
-            "side": str(r["side"]).upper(),
-            "order_type": order_type,
-            "qty": qty,
-            "ref_price": ref,
-            "value_yen": yen,
-            "score": float(r.get("score", 0)),
-            "warn": warn,
-            "shortable": shortable,
-        }
-
-        # BT専用列のみ for_backtest 時に付与
-        if for_backtest:
-            row["date"] = str(as_of_d)
-            row["limit_price"] = r.get("limit_price", None)
-            row["holding_days"] = holding_days
-
-        rows.append(row)
-
-    if not rows:
-        return pd.DataFrame(columns=empty_cols)
-
-    orders = pd.DataFrame(rows)
-
-    # リスク制限
-    orders = apply_order_risk_limits(orders, risk_cfg, score_col="score")
-
-    return orders
+    return result.selected
 
 
 def apply_order_risk_with_audit(
