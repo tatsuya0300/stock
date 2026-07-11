@@ -210,9 +210,16 @@ def _standardize_jquants_v2_frame(df: pd.DataFrame) -> pd.DataFrame:
     x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
 
     for c in [
-        "open", "high", "low", "close",
-        "adj_open", "adj_high", "adj_low", "adj_close",
-        "volume", "turnover",
+        "open",
+        "high",
+        "low",
+        "close",
+        "adj_open",
+        "adj_high",
+        "adj_low",
+        "adj_close",
+        "volume",
+        "turnover",
     ]:
         x[c] = pd.to_numeric(x[c], errors="coerce")
 
@@ -233,9 +240,7 @@ class YFinanceSource(PriceDataSource):
     def __init__(self, *, strict_data_quality: bool = False, chunk_size: int = 50):
         self.strict_data_quality = strict_data_quality
         self.chunk_size = max(1, int(chunk_size))
-        log.warning(
-            "YFinanceSource: turnover=close*volume の近似。本番は JQuantsSource を使用。"
-        )
+        log.warning("YFinanceSource: turnover=close*volume の近似。本番は JQuantsSource を使用。")
 
     def fetch_daily(self, codes: list[str], start: date, end: date) -> pd.DataFrame:
         import yfinance as yf
@@ -349,12 +354,29 @@ class JQuantsSource(PriceDataSource):
         *,
         strict_data_quality: bool = True,
         sleep_sec: float = 0.3,
+        plan: str = "free",
     ):
         if not api_key:
             raise ValueError("JQUANTS_API_KEY is required for JQuantsSource (V2).")
+
+        plan_normalized = plan.lower().strip()
+        if plan_normalized not in _JQUANTS_PLAN_MIN_INTERVAL_SEC:
+            valid = sorted(_JQUANTS_PLAN_MIN_INTERVAL_SEC.keys())
+            raise ValueError(f"J-Quants plan must be one of {valid}: {plan!r}")
+
+        configured_sleep_sec = float(sleep_sec)
+        plan_min = _JQUANTS_PLAN_MIN_INTERVAL_SEC[plan_normalized]
+        if configured_sleep_sec < plan_min:
+            raise ValueError(
+                f"sleep_sec ({configured_sleep_sec}) must be >= {plan} plan minimum ({plan_min})"
+            )
+        max_sleep = 120.0
+        if configured_sleep_sec > max_sleep:
+            raise ValueError(f"sleep_sec ({configured_sleep_sec}) must be <= {max_sleep}")
+
         self.api_key = api_key
         self.strict_data_quality = strict_data_quality
-        self.sleep_sec = sleep_sec
+        self.sleep_sec = configured_sleep_sec
         self._last_request_ts = 0.0
         self.max_retries_on_429 = 3
         self._session = _requests_session_with_retry()
@@ -392,9 +414,9 @@ class JQuantsSource(PriceDataSource):
                     try:
                         backoff = float(retry_after)
                     except ValueError:
-                        backoff = self.sleep_sec * (2 ** attempt)
+                        backoff = self.sleep_sec * (2**attempt)
                 else:
-                    backoff = self.sleep_sec * (2 ** attempt)
+                    backoff = self.sleep_sec * (2**attempt)
                 backoff = min(max(backoff, self.sleep_sec), 120.0)
                 log.warning(
                     "J-Quants rate limited (429). attempt=%d/%d sleep=%.1fs params=%s",
