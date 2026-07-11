@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -49,6 +51,11 @@ class Backtester:
             raise ValueError(
                 f"min_adv_periods ({min_adv_periods}) must be <= adv_window ({adv_window})"
             )
+        warnings.warn(
+            "Backtester is deprecated. Use portfolio.PortfolioBacktester instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.k = float(impact_k_bp)
         self.annual_int = float(annual_interest_rate)
         self.annual_lend = float(annual_lending_rate)

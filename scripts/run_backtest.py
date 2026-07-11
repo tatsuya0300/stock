@@ -35,12 +35,36 @@ def _parse_args() -> argparse.Namespace:
         default="config.yaml",
         help="設定ファイルパス",
     )
+    p.add_argument(
+        "--allow-legacy",
+        action="store_true",
+        default=False,
+        help="旧Backtester（非推奨）の使用を許可する",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
     cfg = load_config(args.config)
+
+    if not args.allow_legacy:
+        print(
+            "=" * 72
+        )
+        print(
+            "  [DEPRECATED] scripts/run_backtest.py は非推奨です。"
+        )
+        print(
+            "  代わりに scripts/run_portfolio_backtest.py を使用してください。"
+        )
+        print(
+            "  旧Backtesterを使用するには --allow-legacy フラグを付けて実行してください。"
+        )
+        print(
+            "=" * 72
+        )
+        raise SystemExit(0)
 
     # P0: 近似 turnover で impact/sizing を使う BT を拒否
     guard_approximate_turnover(cfg, context="run_backtest")

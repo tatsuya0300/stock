@@ -122,9 +122,21 @@ python main.py closing --fills data/fills_YYYY-MM-DD.csv
 
 ### バックテスト
 
+**非推奨（旧）Backtester:**
+
 ```bash
 # 事前に価格データを DB へ取り込む（main.py 実行など）
-python scripts/run_backtest.py
+python scripts/run_backtest.py          # → 非推奨通知により停止
+python scripts/run_backtest.py --allow-legacy  # 旧BTを強制実行
+```
+
+`scripts/run_backtest.py` の旧 `Backtester` は非推奨です。
+代わりに `scripts/run_portfolio_backtest.py`（`PortfolioBacktester`）を使用してください。
+
+**推奨:**
+
+```bash
+python scripts/run_portfolio_backtest.py
 ```
 
 ## データソース切替
