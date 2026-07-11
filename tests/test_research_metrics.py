@@ -6,6 +6,7 @@ import pytest
 
 from jp_signal.research_metrics import (
     benchmark_statistics,
+    drawdown_series_from_returns,
     estimate_trade_turnover,
     holm_adjust,
     ledger_returns,
@@ -160,3 +161,68 @@ def test_holm_adjust():
 def test_holm_rejects_invalid_p_values():
     with pytest.raises(ValueError):
         holm_adjust([0.1, 1.2])
+
+
+def test_drawdown_includes_first_day_loss():
+    returns = pd.Series(
+        [-0.10, 0.05],
+        index=pd.to_datetime(
+            [
+                "2024-01-02",
+                "2024-01-03",
+            ]
+        ),
+    )
+
+    drawdown = drawdown_series_from_returns(returns)
+
+    assert drawdown.iloc[0] == pytest.approx(-0.10)
+    assert drawdown.min() == pytest.approx(-0.10)
+
+
+def test_research_performance_includes_first_day_drawdown():
+    ledger = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-02",
+                "nav": 900_000,
+            },
+            {
+                "date": "2024-01-03",
+                "nav": 945_000,
+            },
+        ]
+    )
+
+    result = summarize_research_performance(
+        ledger,
+        initial_capital=1_000_000,
+    )
+
+    assert result["max_drawdown"] == pytest.approx(-0.10)
+
+
+def test_benchmark_statistics_zero_variance():
+    """benchmark varianceがゼロの場合にゼロ割が発生しないことを確認する。"""
+    dates = pd.date_range(
+        "2024-01-01",
+        periods=5,
+        freq="B",
+    )
+
+    benchmark = pd.Series(
+        [0.01] * 5,
+        index=dates,
+    )
+    strategy = pd.Series(
+        [0.02] * 5,
+        index=dates,
+    )
+
+    result = benchmark_statistics(
+        strategy,
+        benchmark,
+    )
+
+    assert result["benchmark_observations"] == 5
+    assert result["benchmark_beta"] == 0.0

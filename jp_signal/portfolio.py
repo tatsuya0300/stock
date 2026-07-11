@@ -264,6 +264,83 @@ class PortfolioBacktester:
             return value
         return fallback
 
+    @staticmethod
+    def _mark_at_open_price(
+        history: dict[str, pd.DataFrame],
+        code: str,
+        date: pd.Timestamp,
+        fallback: float,
+    ) -> float:
+        """寄付き時点の評価価格を返す。
+
+        当日の有効なopenがあれば使用する。
+        当日openが欠損している場合は、前営業日までの直近closeを使用する。
+        当日closeは寄付き時点で未確定なので使用しない。
+        """
+        frame = history.get(code)
+        if frame is None or frame.empty:
+            return fallback
+
+        if date in frame.index:
+            row = frame.loc[date]
+
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[-1]
+
+            if "open" in row.index:
+                open_price = float(row["open"])
+                if np.isfinite(open_price) and open_price > 0:
+                    return open_price
+
+        previous = frame.loc[frame.index < date]
+        if previous.empty:
+            return fallback
+
+        prev_row = previous.iloc[-1]
+        if "close" in prev_row.index:
+            close_price = float(prev_row["close"])
+            if np.isfinite(close_price) and close_price > 0:
+                return close_price
+
+        return fallback
+
+    def _exposure_at_open(
+        self,
+        positions: list[Position],
+        history: dict[str, pd.DataFrame],
+        date: pd.Timestamp,
+    ) -> dict[str, float]:
+        """寄付き時点の既存ポジションexposureを計算する。
+
+        当日引けで決済予定のポジションも、当日寄付き時点では
+        まだ存在するため計算対象に含める。
+        """
+        long_value = 0.0
+        short_value = 0.0
+
+        for position in positions:
+            price = self._mark_at_open_price(
+                history,
+                position.code,
+                date,
+                position.entry_price,
+            )
+            value = price * position.qty
+
+            if position.side == "BUY":
+                long_value += value
+            elif position.side == "SELL":
+                short_value += value
+            else:
+                raise ValueError(f"invalid position side: {position.side}")
+
+        return {
+            "long": float(long_value),
+            "short": float(short_value),
+            "gross": float(long_value + short_value),
+            "net": float(long_value - short_value),
+        }
+
     def _exposure(
         self,
         positions: list[Position],
@@ -355,14 +432,10 @@ class PortfolioBacktester:
 
         def selected_exposure() -> tuple[float, float, float]:
             sel_long = base["long"] + sum(
-                float(c["entry_value"])
-                for c in selected
-                if c["side"] == "BUY"
+                float(c["entry_value"]) for c in selected if c["side"] == "BUY"
             )
             sel_short = base["short"] + sum(
-                float(c["entry_value"])
-                for c in selected
-                if c["side"] == "SELL"
+                float(c["entry_value"]) for c in selected if c["side"] == "SELL"
             )
             return sel_long, sel_short, sel_long - sel_short
 
@@ -374,9 +447,7 @@ class PortfolioBacktester:
                 break
 
             excessive_side = "BUY" if net_value > 0 else "SELL"
-            removable = [
-                c for c in selected if c["side"] == excessive_side
-            ]
+            removable = [c for c in selected if c["side"] == excessive_side]
 
             if not removable:
                 break
@@ -474,10 +545,7 @@ class PortfolioBacktester:
             for code, group in px.groupby("code", sort=False)
         }
 
-        trading_dates = sorted(
-            pd.Timestamp(date)
-            for date in px["date"].unique()
-        )
+        trading_dates = sorted(pd.Timestamp(date) for date in px["date"].unique())
 
         if start_date is not None:
             start_ts = pd.Timestamp(start_date).normalize()
@@ -512,6 +580,9 @@ class PortfolioBacktester:
                 self.daily_lending,
             )
 
+            # --- 1b. save positions before closing for open-time risk check ---
+            pre_close_positions = positions[:]
+
             # --- 2. close positions whose planned_exit_date <= date ---
             closing_positions: list[Position] = []
             remaining_positions: list[Position] = []
@@ -529,19 +600,21 @@ class PortfolioBacktester:
 
             for pos in closing_positions:
                 # 決済日の価格を取得。欠損している場合は決済を延期
-                frame = history.get(pos.code)
+                frame_px = history.get(str(pos.code))
+                if frame_px is None or frame_px.empty:
+                    deferred_positions.append(pos)
+                    continue
+
                 exact_available = (
-                    frame is not None
-                    and not frame.empty
-                    and date in frame.index
-                    and np.isfinite(frame.loc[date, "close"])
-                    and frame.loc[date, "close"] > 0
+                    date in frame_px.index
+                    and np.isfinite(frame_px.loc[date, "close"])
+                    and frame_px.loc[date, "close"] > 0
                 )
                 if not exact_available:
                     deferred_positions.append(pos)
                     continue
 
-                exit_price_raw = float(frame.loc[date, "close"])
+                exit_price_raw = float(frame_px.loc[date, "close"])
 
                 exit_adv = self._adv_for_order(history, pos.code, date)
                 if self.require_liquidity_data and not self._is_valid_adv(exit_adv):
@@ -613,7 +686,8 @@ class PortfolioBacktester:
             day_orders = od[od["date"] == date]
             candidates: list[dict] = []
 
-            existing_codes: set[str] = {p.code for p in positions}
+            # 寄付き時点では決済予定のポジションも存在するため既存コードとして扱う
+            existing_codes: set[str] = {p.code for p in pre_close_positions}
             seen_codes_today: set[str] = set()
 
             for _, row in day_orders.iterrows():
@@ -726,7 +800,8 @@ class PortfolioBacktester:
                     }
                 )
 
-            base_exposure = self._exposure(positions, history, date)
+            # 寄付き時点のリスク判定: 当日引けで決済予定のポジションも含める
+            base_exposure = self._exposure_at_open(pre_close_positions, history, date)
             selected, day_rejected = self._select_orders(candidates, base_exposure)
 
             for candidate, reason in day_rejected:

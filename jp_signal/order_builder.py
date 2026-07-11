@@ -26,26 +26,67 @@ def is_shortable_asof(
     shortability: pd.DataFrame | None,
     code: str,
     as_of: date | str,
+    max_age_calendar_days: int = 4,
 ) -> bool:
-    """as_of 以前の直近スナップショットで売り可否を判定。
+    """as_of以前の直近スナップショットで売り可否を判定する。
 
-    欠損・未来参照は常に False（保守側）。
+    条件:
+      - 未来のスナップショットを参照しない
+      - 最新スナップショットがmax_age_calendar_days以内
+      - is_margin_lendable == 1
+      - short_restricted == 0
+
+    金曜日のスナップショットを月曜日に利用できるよう、
+    デフォルトは4暦日とする。ただし本番では取得時刻を含む
+    effective_at/fetched_at管理へ移行すること。
     """
+    if max_age_calendar_days < 0:
+        raise ValueError(f"max_age_calendar_days must be >= 0: {max_age_calendar_days}")
+
     if shortability is None or shortability.empty:
         return False
 
+    required = {
+        "code",
+        "date",
+        "is_margin_lendable",
+        "short_restricted",
+    }
+    missing = required - set(shortability.columns)
+
+    if missing:
+        return False
+
     sub = shortability[shortability["code"].astype(str) == str(code)].copy()
+
     if sub.empty:
         return False
 
-    asof_ts = pd.Timestamp(as_of)
-    sub["date"] = pd.to_datetime(sub["date"])
+    asof_ts = pd.Timestamp(as_of).normalize()
+    sub["date"] = pd.to_datetime(
+        sub["date"],
+        errors="coerce",
+    ).dt.normalize()
+    sub = sub.dropna(subset=["date"])
+
     past = sub[sub["date"] <= asof_ts]
     if past.empty:
         return False
 
     latest = past.sort_values("date").iloc[-1]
-    return int(latest["is_margin_lendable"]) == 1 and int(latest["short_restricted"]) == 0
+    latest_date = pd.Timestamp(latest["date"])
+    age_days = (asof_ts - latest_date).days
+
+    if age_days > max_age_calendar_days:
+        return False
+
+    try:
+        is_margin_lendable = int(latest["is_margin_lendable"])
+        short_restricted = int(latest["short_restricted"])
+    except (TypeError, ValueError):
+        return False
+
+    return is_margin_lendable == 1 and short_restricted == 0
 
 
 def _ref_rows_before(prices: pd.DataFrame, as_of: date | str) -> pd.DataFrame:
@@ -71,6 +112,7 @@ def signals_to_orders(
     order_type: str = "MKT_OPEN",
     unit: int = 100,
     for_backtest: bool = False,
+    shortability_max_age_days: int = 4,
 ) -> pd.DataFrame:
     """シグナル DataFrame をリスク制限後の orders に変換する。
 
@@ -102,9 +144,17 @@ def signals_to_orders(
 
     adv_window = int(sizing_cfg.get("adv_window", 20))
     min_adv_periods = int(sizing_cfg.get("min_adv_periods", 1))
-    require_full_adv_history = bool(sizing_cfg.get("require_full_adv_history", False))
+    require_full_adv_history = bool(
+        sizing_cfg.get(
+            "require_full_adv_history",
+            True,
+        )
+    )
     allow_single_day_turnover_fallback = bool(
-        sizing_cfg.get("allow_single_day_turnover_fallback", True)
+        sizing_cfg.get(
+            "allow_single_day_turnover_fallback",
+            False,
+        )
     )
 
     adv_series = rolling_adv_before(
@@ -147,7 +197,12 @@ def signals_to_orders(
         if qty == 0:
             continue
 
-        shortable = is_shortable_asof(shortability, code, as_of_d)
+        shortable = is_shortable_asof(
+            shortability,
+            code,
+            as_of_d,
+            max_age_calendar_days=shortability_max_age_days,
+        )
 
         name = ""
         if univ_idx is not None and code in univ_idx.index:

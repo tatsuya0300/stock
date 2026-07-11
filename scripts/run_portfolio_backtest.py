@@ -40,9 +40,7 @@ def _parse_args() -> argparse.Namespace:
 
 def _json_safe_summary(summary: dict) -> dict:
     return {
-        key: value
-        for key, value in summary.items()
-        if key not in {"daily_returns", "equity_curve"}
+        key: value for key, value in summary.items() if key not in {"daily_returns", "equity_curve"}
     }
 
 
@@ -109,14 +107,8 @@ def main() -> None:
     prices = prices.copy()
     prices["_date_ts"] = pd.to_datetime(prices["date"])
 
-    all_dates = sorted(
-        pd.to_datetime(prices["date"]).strftime("%Y-%m-%d").unique()
-    )
-    all_dates = [
-        d
-        for d in all_dates
-        if cfg["backtest"]["start"] <= d <= cfg["backtest"]["end"]
-    ]
+    all_dates = sorted(pd.to_datetime(prices["date"]).strftime("%Y-%m-%d").unique())
+    all_dates = [d for d in all_dates if cfg["backtest"]["start"] <= d <= cfg["backtest"]["end"]]
 
     if not all_dates:
         print("BT期間に該当する日付がありません。")
@@ -164,6 +156,12 @@ def main() -> None:
             order_type="MKT_OPEN",
             unit=int(cfg.get("sizing", {}).get("unit", 100)),
             for_backtest=True,
+            shortability_max_age_days=int(
+                cfg.get("risk", {}).get(
+                    "shortability_max_age_days",
+                    4,
+                )
+            ),
         )
         if not day_orders.empty:
             all_order_frames.append(day_orders)
@@ -218,9 +216,7 @@ def main() -> None:
 
     result.trades.to_csv(os.path.join(out_dir, "portfolio_trades.csv"), index=False)
     result.daily_ledger.to_csv(os.path.join(out_dir, "daily_ledger.csv"), index=False)
-    result.rejected_orders.to_csv(
-        os.path.join(out_dir, "rejected_orders.csv"), index=False
-    )
+    result.rejected_orders.to_csv(os.path.join(out_dir, "rejected_orders.csv"), index=False)
 
     write_backtest_manifest(
         out_dir=out_dir,

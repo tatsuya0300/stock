@@ -66,7 +66,13 @@ def test_signals_to_orders_includes_name_for_live():
         sig,
         prices,
         as_of="2024-01-11",
-        sizing_cfg={"adv_ratio": 0.001, "adv_ratio_cap": 0.002, "market_open_unit_cap": 50},
+        sizing_cfg={
+            "adv_ratio": 0.001,
+            "adv_ratio_cap": 0.002,
+            "market_open_unit_cap": 50,
+            "require_full_adv_history": False,
+            "allow_single_day_turnover_fallback": True,
+        },
         risk_cfg=risk,
         universe=univ,
         for_backtest=False,
@@ -78,6 +84,75 @@ def test_signals_to_orders_includes_name_for_live():
     # for_backtest=False でも date/limit_price/holding_days が無いこと
     assert "date" not in orders.columns or orders["date"].isna().all()
     assert "limit_price" not in orders.columns or orders["limit_price"].isna().all()
+
+
+def test_is_shortable_rejects_stale_snapshot():
+    sh = pd.DataFrame(
+        [
+            {
+                "code": "7203",
+                "date": "2024-01-01",
+                "is_margin_lendable": 1,
+                "short_restricted": 0,
+            }
+        ]
+    )
+
+    assert (
+        is_shortable_asof(
+            sh,
+            "7203",
+            "2024-01-10",
+            max_age_calendar_days=4,
+        )
+        is False
+    )
+
+
+def test_is_shortable_accepts_recent_snapshot():
+    sh = pd.DataFrame(
+        [
+            {
+                "code": "7203",
+                "date": "2024-01-08",
+                "is_margin_lendable": 1,
+                "short_restricted": 0,
+            }
+        ]
+    )
+
+    assert (
+        is_shortable_asof(
+            sh,
+            "7203",
+            "2024-01-10",
+            max_age_calendar_days=4,
+        )
+        is True
+    )
+
+
+def test_is_shortable_rejects_future_snapshot():
+    sh = pd.DataFrame(
+        [
+            {
+                "code": "7203",
+                "date": "2024-01-11",
+                "is_margin_lendable": 1,
+                "short_restricted": 0,
+            }
+        ]
+    )
+
+    assert (
+        is_shortable_asof(
+            sh,
+            "7203",
+            "2024-01-10",
+            max_age_calendar_days=4,
+        )
+        is False
+    )
 
 
 def test_signals_to_orders_drops_unshortable_sell():
@@ -117,7 +192,13 @@ def test_signals_to_orders_drops_unshortable_sell():
         sig,
         prices,
         as_of="2024-01-11",
-        sizing_cfg={"adv_ratio": 0.001, "adv_ratio_cap": 0.002, "market_open_unit_cap": 50},
+        sizing_cfg={
+            "adv_ratio": 0.001,
+            "adv_ratio_cap": 0.002,
+            "market_open_unit_cap": 50,
+            "require_full_adv_history": False,
+            "allow_single_day_turnover_fallback": True,
+        },
         risk_cfg=risk,
         shortability=None,
     )

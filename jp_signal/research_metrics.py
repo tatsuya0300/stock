@@ -70,7 +70,11 @@ def ledger_returns(
 def drawdown_series_from_returns(
     returns: pd.Series,
 ) -> pd.Series:
-    """リターン系列からdrawdown系列を作る。"""
+    """リターン系列からdrawdown系列を作る。
+
+    初期資産1.0を基準点として含める。
+    これにより初日の損失もdrawdownとして正しく計上する。
+    """
     clean = pd.to_numeric(
         returns,
         errors="coerce",
@@ -80,9 +84,12 @@ def drawdown_series_from_returns(
         return pd.Series(dtype=float, name="drawdown")
 
     equity = (1.0 + clean).cumprod()
-    peak = equity.cummax()
 
-    drawdown = equity / peak - 1.0
+    # 初期資産1.0をrunning peakの基準に含める。
+    # 初日のリターンが-10%の場合、初日drawdownは-10%になる。
+    running_peak = equity.cummax().clip(lower=1.0)
+
+    drawdown = equity / running_peak - 1.0
     drawdown.name = "drawdown"
 
     return drawdown
@@ -199,7 +206,14 @@ def benchmark_statistics(
     strategy_arr = aligned["strategy"].to_numpy(dtype=float)
     benchmark_arr = aligned["benchmark"].to_numpy(dtype=float)
 
-    beta = float(np.cov(strategy_arr, benchmark_arr)[0, 1] / np.var(benchmark_arr, ddof=1))
+    benchmark_variance = float(np.var(benchmark_arr, ddof=1))
+
+    if benchmark_variance < 1e-12:
+        beta = 0.0
+    else:
+        beta = float(
+            np.cov(strategy_arr, benchmark_arr)[0, 1] / benchmark_variance
+        )
     daily_alpha = float(strategy_arr.mean() - beta * benchmark_arr.mean())
 
     active = strategy_arr - benchmark_arr

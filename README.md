@@ -102,12 +102,16 @@ pip install -r requirements-dev.txt   # 開発時
 ### 寄前パイプライン
 
 ```bash
-python main.py
+python main.py morning \
+  --config configs/demo.yaml \
+  --dry-run
 # または
+python main.py
 python main.py morning
-python main.py morning --dry-run
-python main.py morning --date 2026-07-09
+python main.py morning --dry-run --date 2026-07-09
 ```
+
+configs/demo.yamlはyfinanceの近似turnoverを使用するため、結果は疎通確認専用です。
 
 ### 引け後
 
@@ -244,10 +248,21 @@ date,return
 ## 開発
 
 ```bash
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
+
 ruff check .
-mypy jp_signal --ignore-missing-imports
-pytest -q
+mypy jp_signal
+pytest --cov=jp_signal --cov-report=term-missing
 ```
+
+GitHub Actions:
+
+- Python 3.11 / 3.12
+- Ruff
+- mypy
+- pytest
+- coverage artifact
 
 CI: `.github/workflows/ci.yml`（push / pull_request）
 
