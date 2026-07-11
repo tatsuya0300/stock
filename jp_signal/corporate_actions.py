@@ -81,7 +81,7 @@ def _apply_corporate_actions(
     ex_date: str,
     cash: float,
     ledger: list[dict] | None = None,
-) -> tuple[list, float]:
+) -> tuple[list, float, list[dict]]:
     """コーポレートアクションをポジションに適用する。
 
     SPLIT:
@@ -91,22 +91,25 @@ def _apply_corporate_actions(
     CASH_DIVIDEND:
       - 長期保有（BUY）は amount * qty を受取（cash増加）
       - 空売り（SELL）は amount * qty を支払い（cash減少）
-      - ledger に dividend_cashflow として記録
+
+    コーポレートアクションイベントのリストは返り値の第3要素で受け取る。
+    ledger パラメータは後方互換性のため残しているが非推奨。
 
     Args:
         positions: ポジションリスト（Position オブジェクト）
         actions: 該当日のコーポレートアクションリスト
         ex_date: 権利落ち日（YYYY-MM-DD）
         cash: 現在の現金残高
-        ledger: 日次台帳リスト（オプション、dividend_cashflow記録用）
+        ledger: 非推奨。代わりに返り値のeventsを使用すること
 
     Returns:
-        (更新されたポジションリスト, 更新されたcash)
+        (更新されたポジションリスト, 更新されたcash, コーポレートアクションイベントリスト)
     """
     if not actions:
-        return positions, cash
+        return positions, cash, []
 
     updated_positions = []
+    events: list[dict] = []
 
     # 該当銘柄のアクションをグループ化
     action_map: dict[str, list[CorporateAction]] = {}
@@ -152,6 +155,20 @@ def _apply_corporate_actions(
                     }
                 )
 
+            events.append(
+                {
+                    "date": ex_date,
+                    "code": code,
+                    "action_type": "CASH_DIVIDEND",
+                    "amount": sum(
+                        a.amount
+                        for a in action_map[code]
+                        if a.action_type == "CASH_DIVIDEND" and a.amount
+                    ),
+                    "cashflow": total_dividend,
+                }
+            )
+
         # qty/entry_price が変わった場合、新しい Position を作成
         if pos_dict["qty"] != pos.qty or pos_dict["entry_price"] != pos.entry_price:
             from dataclasses import replace
@@ -166,4 +183,4 @@ def _apply_corporate_actions(
         else:
             updated_positions.append(pos)
 
-    return updated_positions, cash
+    return updated_positions, cash, events

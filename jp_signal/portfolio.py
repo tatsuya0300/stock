@@ -62,6 +62,18 @@ class PortfolioResult:
     rejected_orders: pd.DataFrame
     daily_ledger: pd.DataFrame
     open_positions: pd.DataFrame
+    corporate_action_events: pd.DataFrame
+
+    @staticmethod
+    def _empty_result() -> PortfolioResult:
+        empty = pd.DataFrame()
+        return PortfolioResult(
+            trades=empty,
+            rejected_orders=empty,
+            daily_ledger=empty,
+            open_positions=empty,
+            corporate_action_events=empty,
+        )
 
 
 class PortfolioBacktester:
@@ -571,17 +583,10 @@ class PortfolioBacktester:
         end_date: str | None = None,
         corporate_actions: list[CorporateAction] | None = None,
     ) -> PortfolioResult:
-        if orders is None or orders.empty:
-            empty = pd.DataFrame()
-            return PortfolioResult(
-                trades=empty,
-                rejected_orders=empty,
-                daily_ledger=empty,
-                open_positions=empty,
-            )
+        if prices is None or prices.empty:
+            return self._empty_result()
 
         px = self._prepare_prices(prices)
-        od = self._prepare_orders(orders)
 
         # 事前計算: 全code/dateのprior ADVマップ
         adv_map = self._build_prior_adv_map(px)
@@ -606,13 +611,36 @@ class PortfolioBacktester:
             trading_dates = [d for d in trading_dates if d <= end_ts]
 
         if not trading_dates:
-            empty = pd.DataFrame()
-            return PortfolioResult(
-                trades=empty,
-                rejected_orders=empty,
-                daily_ledger=empty,
-                open_positions=empty,
+            return self._empty_result()
+
+        # 注文が0件でもflat NAVを正式なBT結果として返す。
+        if orders is None or orders.empty:
+            daily_ledger = pd.DataFrame(
+                [
+                    {
+                        "date": str(day.date()),
+                        "cash": self.initial_capital,
+                        "long_exposure": 0.0,
+                        "short_exposure": 0.0,
+                        "gross_exposure": 0.0,
+                        "net_exposure": 0.0,
+                        "open_position_count": 0,
+                        "accrued_carry": 0.0,
+                        "nav": self.initial_capital,
+                    }
+                    for day in trading_dates
+                ]
             )
+
+            return PortfolioResult(
+                trades=pd.DataFrame(),
+                rejected_orders=pd.DataFrame(),
+                daily_ledger=daily_ledger,
+                open_positions=pd.DataFrame(),
+                corporate_action_events=pd.DataFrame(),
+            )
+
+        od = self._prepare_orders(orders)
 
         # state
         cash = self.initial_capital
@@ -620,6 +648,7 @@ class PortfolioBacktester:
         trades: list[dict] = []
         rejected_orders: list[dict] = []
         daily_ledger: list[dict] = []
+        corporate_action_events: list[dict] = []
         position_sequence = 0
 
         ca_grouped = self._group_corporate_actions(corporate_actions) if corporate_actions else {}
@@ -630,10 +659,13 @@ class PortfolioBacktester:
             # --- 0. apply corporate actions ---
             day_ca = ca_grouped.get(date_str, [])
             if day_ca:
-                positions, cash = _apply_corporate_actions(
-                    positions, day_ca, date_str, cash,
-                    ledger=daily_ledger,
+                positions, cash, ca_events = _apply_corporate_actions(
+                    positions,
+                    day_ca,
+                    date_str,
+                    cash,
                 )
+                corporate_action_events.extend(ca_events)
 
             # --- 1. accrue carry on existing positions ---
             positions = self._accrue_carry(
@@ -943,6 +975,9 @@ class PortfolioBacktester:
             daily_ledger=pd.DataFrame(daily_ledger) if daily_ledger else pd.DataFrame(),
             open_positions=(
                 pd.DataFrame([asdict(p) for p in positions]) if positions else pd.DataFrame()
+            ),
+            corporate_action_events=(
+                pd.DataFrame(corporate_action_events) if corporate_action_events else pd.DataFrame()
             ),
         )
 
