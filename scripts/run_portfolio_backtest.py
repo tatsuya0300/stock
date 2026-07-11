@@ -223,11 +223,12 @@ def main() -> None:
         if not day_orders.empty:
             all_order_frames.append(day_orders)
 
-    if not all_order_frames:
-        print("シグナル0件。バックテストをスキップします。")
-        return
+    all_orders = (
+        pd.concat(all_order_frames, ignore_index=True) if all_order_frames else pd.DataFrame()
+    )
 
-    all_orders = pd.concat(all_order_frames, ignore_index=True)
+    if all_orders.empty:
+        print("シグナル0件。空の注文でバックテストを実行します（flat NAV）。")
 
     bt = PortfolioBacktester(
         initial_capital=float(cfg["backtest"].get("initial_capital", 100_000_000)),
@@ -250,8 +251,7 @@ def main() -> None:
     )
 
     if result.trades.empty:
-        print("約定0件。")
-        return
+        print("約定0件。NAV ledgerは出力されます。")
 
     summary = summarize_portfolio_ledger(
         result.daily_ledger,
@@ -274,6 +274,10 @@ def main() -> None:
     result.trades.to_csv(os.path.join(out_dir, "portfolio_trades.csv"), index=False)
     result.daily_ledger.to_csv(os.path.join(out_dir, "daily_ledger.csv"), index=False)
     result.rejected_orders.to_csv(os.path.join(out_dir, "rejected_orders.csv"), index=False)
+    if not result.corporate_action_events.empty:
+        result.corporate_action_events.to_csv(
+            os.path.join(out_dir, "corporate_action_events.csv"), index=False
+        )
 
     write_backtest_manifest(
         out_dir=out_dir,
