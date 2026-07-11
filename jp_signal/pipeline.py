@@ -61,6 +61,7 @@ def _fetch_prices_incremental(
     as_of: date,
     *,
     dry_run: bool = False,
+    source_name: str = "unknown",
 ) -> pd.DataFrame:
     """銘柄単位で価格を差分取得する。
 
@@ -121,7 +122,7 @@ def _fetch_prices_incremental(
             )
             continue
 
-        storage.upsert_prices(fresh)
+        storage.ingest_prices(fresh, source=source_name)
         fetched_frames.append(fresh)
 
     # upsert後にDBから再読込し、既存＋新規を一貫した形で返す
@@ -171,7 +172,8 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
         )
 
     try:
-        df = _fetch_prices_incremental(ds, storage, codes, as_of, dry_run=dry_run)
+        source_name = cfg.get("data", {}).get("source", "unknown")
+        df = _fetch_prices_incremental(ds, storage, codes, as_of, dry_run=dry_run, source_name=source_name)
         if df.empty:
             notifier.send("本日はシグナル生成不可", "データ取得失敗")
             return pd.DataFrame()

@@ -1,11 +1,14 @@
 """SQLite 永続化レイヤ。
 
-schema v3:
+schema v4:
 - raw OHLC と adjusted OHLC を分離
 - signals/orders/fills を追加
 - signals/orders に PRIMARY KEY を追加し ON CONFLICT DO UPDATE を有効化
 - shortability テーブル
 - INSERT OR REPLACE を避け、ON CONFLICT DO UPDATE を使用
+- order_rejections テーブル (v3)
+- price_observations テーブル（取得時刻・revision履歴）(v4)
+- record_price_observations() / ingest_prices()
 """
 
 from __future__ import annotations
@@ -13,11 +16,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _sha256_file(path: str | Path) -> str:
@@ -28,6 +32,21 @@ def _sha256_file(path: str | Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _utc_now_iso() -> str:
+    """現在UTC時刻をISO 8601形式で返す（マイクロ秒精度）。"""
+    return datetime.now(UTC).isoformat()
+
+
+def _price_payload_hash(row: dict) -> str:
+    """PRICE_COLSからSHA256ペイロードハッシュを計算する。
+
+    JSONシリアライズはソート済みキーで行い、ハッシュの一貫性を保証する。
+    """
+    payload = {k: row.get(k) for k in PRICE_COLS}
+    serialized = json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 PRICE_COLS = [
@@ -141,6 +160,20 @@ ON order_rejections(rejection_date);
 
 CREATE INDEX IF NOT EXISTS idx_order_rejections_run
 ON order_rejections(run_id);
+
+CREATE TABLE IF NOT EXISTS price_observations (
+    code TEXT NOT NULL,
+    date TEXT NOT NULL,
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    available_at TEXT,
+    payload_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(code, date, source, payload_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_observations_lookup
+ON price_observations(code, date, source);
 """
 
 
@@ -247,6 +280,82 @@ class Storage:
         """
         with self.conn:
             self.conn.executemany(sql, records)
+
+    def record_price_observations(
+        self,
+        df: pd.DataFrame,
+        *,
+        source: str,
+        available_at: str | None = None,
+    ) -> int:
+        """価格データのリビジョン履歴を price_observations に記録する。
+
+        各(code, date, source) のペイロード内容が前回と異なる場合のみ
+        新しい行を挿入する（同一ハッシュならスキップ）。
+
+        Returns:
+            新規挿入行数。
+        """
+        if df is None or df.empty:
+            return 0
+
+        fetched_at = _utc_now_iso()
+        x = df.copy()
+        x["code"] = x["code"].astype(str).str.strip()
+        x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
+
+        sql = """
+        INSERT OR IGNORE INTO price_observations (
+            code, date, source, fetched_at, available_at, payload_hash
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+
+        records: list[tuple[str, str, str, str, str | None, str]] = []
+        for _, row in x.iterrows():
+            row_dict = row.to_dict()
+            payload_hash = _price_payload_hash(row_dict)
+            records.append(
+                (
+                    str(row_dict.get("code", "")),
+                    str(row_dict.get("date", "")),
+                    source,
+                    fetched_at,
+                    available_at,
+                    payload_hash,
+                )
+            )
+
+        with self.conn:
+            self.conn.executemany(sql, records)
+            n = self.conn.total_changes
+
+        return n
+
+    def ingest_prices(
+        self,
+        df: pd.DataFrame,
+        *,
+        source: str,
+        available_at: str | None = None,
+    ) -> None:
+        """価格データの取込（リビジョン記録 + 最新投影の更新）を一括で行う。
+
+        同一トランザクション内で以下を実行:
+        1. record_price_observations() — リビジョン履歴の保存
+        2. upsert_prices() — prices テーブルの最新値更新
+
+        Args:
+            df: 価格データフレーム（PRICE_COLS を含む）
+            source: データソース名（例: "jquants", "yfinance"）
+            available_at: ISO 8601 形式の利用可能時刻（None なら fetched_at と同じ）
+        """
+        if df is None or df.empty:
+            return
+
+        with self.conn:
+            self.record_price_observations(df, source=source, available_at=available_at)
+            self.upsert_prices(df)
 
     def load_prices(self, codes: list[str], start: str, end: str) -> pd.DataFrame:
         if not codes:

@@ -20,5 +20,11 @@ data/*.db-wal
 data/*.lock
 data/topix500.csv
 
+# Coverage
+.coverage
+
+# GitHub workflows (not pushable with current token)
+.github/
+
 # OS
 .DS_Store
