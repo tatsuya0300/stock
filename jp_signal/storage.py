@@ -6,6 +6,8 @@ schema v3:
 - signals/orders に PRIMARY KEY を追加し ON CONFLICT DO UPDATE を有効化
 - shortability テーブル
 - INSERT OR REPLACE を避け、ON CONFLICT DO UPDATE を使用
+- order_rejections テーブル
+- shortability_observations テーブル: PIT管理の観測履歴（effective_at/fetched_at）
 """
 
 from __future__ import annotations
@@ -18,6 +20,15 @@ from pathlib import Path
 import pandas as pd
 
 SCHEMA_VERSION = 3
+
+_SHORTABILITY_OBS_COLS = [
+    "code",
+    "date",
+    "effective_at",
+    "fetched_at",
+    "is_margin_lendable",
+    "short_restricted",
+]
 
 
 def _sha256_file(path: str | Path) -> str:
@@ -141,6 +152,24 @@ ON order_rejections(rejection_date);
 
 CREATE INDEX IF NOT EXISTS idx_order_rejections_run
 ON order_rejections(run_id);
+
+CREATE TABLE IF NOT EXISTS shortability_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL,
+    date TEXT NOT NULL,
+    effective_at TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    is_margin_lendable INTEGER NOT NULL,
+    short_restricted INTEGER NOT NULL,
+    source TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_shortability_obs_lookup
+ON shortability_observations(code, date);
+
+CREATE INDEX IF NOT EXISTS idx_shortability_obs_effective
+ON shortability_observations(code, effective_at);
 """
 
 
@@ -295,6 +324,41 @@ class Storage:
         ORDER BY code, date
         """
         return pd.read_sql(q, self.conn, params=[*codes, start, end])
+
+    def insert_shortability_observations(self, df: pd.DataFrame, *, source: str = "") -> None:
+        """PIT shortability 観測データを shortability_observations テーブルに挿入する。
+
+        Args:
+            df: 正規化された shortability DataFrame
+                （code, date, effective_at, fetched_at, is_margin_lendable, short_restricted）
+            source: データソース名（例: "jsf_csv"）
+        """
+        if df is None or df.empty:
+            return
+
+        required = {"code", "date", "effective_at", "fetched_at", "is_margin_lendable", "short_restricted"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"shortability_observations に必須列が不足: {sorted(missing)}")
+
+        x = df.copy()
+        x["code"] = x["code"].astype(str).str.strip()
+        x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
+
+        records = list(
+            x[["code", "date", "effective_at", "fetched_at", "is_margin_lendable", "short_restricted"]]
+            .itertuples(index=False, name=None)
+        )
+
+        sql = """
+        INSERT INTO shortability_observations (
+            code, date, effective_at, fetched_at,
+            is_margin_lendable, short_restricted, source
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        with self.conn:
+            self.conn.executemany(sql, [(*r, source) for r in records])
 
     def append_signals(
         self,
