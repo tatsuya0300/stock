@@ -29,7 +29,7 @@ from .coverage import CoverageThresholds, validate_daily_coverage
 from .datasource import JQuantsSource, YFinanceSource
 from .model import MeanReversionRule
 from .notifier import ConsoleNotifier, DiscordNotifier, format_orders
-from .order_builder import signals_to_orders
+from .order_builder import build_orders_with_audit
 from .risk import risk_config_from_dict
 from .storage import Storage
 from .universe import load_universe
@@ -231,7 +231,7 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
         risk_cfg = risk_config_from_dict(cfg.get("risk", {}))
         unit = int(cfg.get("sizing", {}).get("unit", 100))
 
-        orders = signals_to_orders(
+        order_result = build_orders_with_audit(
             sig,
             df,
             as_of=as_of,
@@ -248,6 +248,20 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
                     4,
                 )
             ),
+        )
+
+        orders = order_result.selected
+
+        if not dry_run and storage is not None and not order_result.rejected.empty:
+            storage.append_order_rejections(
+                run_id=run_id,
+                rejection_date=str(as_of),
+                rejected=order_result.rejected,
+            )
+
+        log.info(
+            "order build diagnostics: %s",
+            order_result.diagnostics,
         )
 
         if orders.empty:
