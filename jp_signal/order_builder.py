@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from . import normalize_code
 from .adv import rolling_adv_before
 from .calendar import previous_business_day
 from .risk import (
@@ -338,7 +339,7 @@ def build_orders_with_audit(
         rejected_rows.append(row)
 
     for _, signal in signals.iterrows():
-        code = str(signal.get("code", "")).strip()
+        code = normalize_code(signal.get("code", ""))
         side = str(signal.get("side", "")).upper()
 
         if not code:
