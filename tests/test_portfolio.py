@@ -549,12 +549,7 @@ def test_same_code_reentry_allowed_after_close():
     """決済日の翌営業日には、同一コードの新規注文が許可される。"""
     prices = make_prices()
     # 01-04の7203データを削除して決済を01-05に延期させる
-    prices = prices[
-        ~(
-            (prices["code"] == "7203")
-            & (prices["date"] == "2024-01-04")
-        )
-    ].copy()
+    prices = prices[~((prices["code"] == "7203") & (prices["date"] == "2024-01-04"))].copy()
 
     orders = pd.DataFrame(
         [
@@ -662,3 +657,122 @@ def test_final_nav_equals_total_realized_pnl():
     final_nav = float(result.daily_ledger.iloc[-1]["nav"])
 
     assert final_nav - 1_000_000 == pytest.approx(realized_pnl)
+
+
+def test_require_both_sides_records_rejection_reason():
+    risk = RiskConfig(
+        max_orders_per_day=10,
+        max_gross_exposure_yen=20_000_000,
+        max_single_name_exposure_yen=10_000_000,
+        max_long_exposure_yen=10_000_000,
+        max_short_exposure_yen=10_000_000,
+        max_net_exposure_yen=10_000_000,
+        require_both_sides=True,
+        allow_short_without_confirmed_shortability=True,
+    )
+
+    bt = PortfolioBacktester(
+        initial_capital=1_000_000,
+        risk=risk,
+        impact_k_bp=0.0,
+        commission_bp=0.0,
+        half_spread_bp=0.0,
+        annual_interest_rate=0.0,
+        annual_lending_rate=0.0,
+        adv_window=2,
+        min_adv_periods=2,
+    )
+
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            }
+        ]
+    )
+
+    result = bt.run(
+        orders,
+        make_prices(),
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    assert result.trades.empty
+    assert not result.rejected_orders.empty
+    assert "REQUIRE_BOTH_SIDES" in set(result.rejected_orders["reason"])
+
+
+def test_position_id_is_deterministic():
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            }
+        ]
+    )
+
+    first = make_backtester().run(
+        orders,
+        make_prices(),
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    second = make_backtester().run(
+        orders,
+        make_prices(),
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    assert first.trades.iloc[0]["position_id"] == (second.trades.iloc[0]["position_id"])
+
+
+def test_prior_adv_does_not_include_current_day_turnover():
+    prices = make_prices().copy()
+
+    # エントリー当日の異常に大きなturnoverがADVへ混入しないことを確認。
+    mask = (prices["code"] == "7203") & (prices["date"] == "2024-01-03")
+    prices.loc[mask, "turnover"] = 999_999_999_999.0
+
+    orders = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "code": "7203",
+                "side": "BUY",
+                "qty": 100,
+                "order_type": "MKT_OPEN",
+                "holding_days": 1,
+                "score": 1.0,
+                "shortable": False,
+            }
+        ]
+    )
+
+    result = make_backtester().run(
+        orders,
+        prices,
+        start_date="2024-01-03",
+        end_date="2024-01-05",
+    )
+
+    trade = result.trades.iloc[0]
+
+    # 2024-01-01、2024-01-02のprior turnover平均。
+    assert trade["entry_adv"] == pytest.approx(100_000_000.0)

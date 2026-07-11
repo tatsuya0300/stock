@@ -32,7 +32,6 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-from .adv import stock_adv_before
 from .risk import RiskConfig
 
 Side = Literal["BUY", "SELL"]
@@ -169,24 +168,56 @@ class PortfolioBacktester:
     # execution helpers
     # ----------------------------------------------------------------
 
-    def _adv_for_order(self, history: dict, code: str, date: pd.Timestamp) -> float:
-        """Return ADV for a code on a given date using price history."""
-        px_flat = []
-        for c, frame in history.items():
-            f = frame.reset_index()
-            f["code"] = c
-            px_flat.append(f)
-        if not px_flat:
-            return float("nan")
-        combined = pd.concat(px_flat, ignore_index=True)
-        return stock_adv_before(
-            combined,
-            date,
-            code,
-            window=self.adv_window,
-            min_periods=self.min_adv_periods,
-            strictly_before=True,
+    def _build_prior_adv_map(
+        self,
+        prices: pd.DataFrame,
+    ) -> dict[tuple[str, pd.Timestamp], float]:
+        """各code/dateについて、当日を含まないprior ADVを事前計算する。
+
+        groupby + shift(1) + rolling で O(n) の計算量で済ませる。
+        """
+        frame = prices[["code", "date", "turnover"]].copy()
+        frame = frame.sort_values(["code", "date"], kind="stable")
+
+        frame["prior_adv"] = frame.groupby("code", sort=False)["turnover"].transform(
+            lambda values: (
+                values.shift(1)
+                .rolling(
+                    window=self.adv_window,
+                    min_periods=self.min_adv_periods,
+                )
+                .mean()
+            )
         )
+
+        return {
+            (str(row.code), pd.Timestamp(row.date).normalize()): float(row.prior_adv)
+            for row in frame.itertuples(index=False)
+        }
+
+    def _make_position_id(
+        self,
+        entry_date: pd.Timestamp,
+        code: str,
+        side: str,
+        qty: int,
+        sequence: int,
+    ) -> str:
+        """同一入力に対して決定論的なposition IDを返す。"""
+        key = "|".join(
+            [
+                "jp_signal",
+                entry_date.strftime("%Y-%m-%d"),
+                str(code),
+                str(side),
+                str(qty),
+                str(sequence),
+            ]
+        )
+        return uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            key,
+        ).hex[:12]
 
     def _execution_price(
         self,
@@ -463,12 +494,16 @@ class PortfolioBacktester:
         net_within_limit = abs(net_value) <= self.risk.max_net_exposure_yen
 
         if not net_within_limit:
+            # NET_LIMITレコードを残したまま空リストを返す
             return [], rejected
 
         # require_both_sides
         if self.risk.require_both_sides:
             sides = {c["side"] for c in selected}
             if not {"BUY", "SELL"}.issubset(sides):
+                # REQUIRE_BOTH_SIDESをrejectedに記録して空リストを返す
+                for c in selected:
+                    rejected.append((c, "REQUIRE_BOTH_SIDES"))
                 return [], rejected
 
         return selected, rejected
@@ -536,6 +571,9 @@ class PortfolioBacktester:
         px = self._prepare_prices(prices)
         od = self._prepare_orders(orders)
 
+        # 事前計算: 全code/dateのprior ADVマップ
+        adv_map = self._build_prior_adv_map(px)
+
         price_map = {}
         for _, row in px.iterrows():
             key = (str(row["code"]), pd.Timestamp(row["date"]).normalize())
@@ -570,6 +608,7 @@ class PortfolioBacktester:
         trades: list[dict] = []
         rejected_orders: list[dict] = []
         daily_ledger: list[dict] = []
+        position_sequence = 0
 
         for date in trading_dates:
             # --- 1. accrue carry on existing positions ---
@@ -616,7 +655,10 @@ class PortfolioBacktester:
 
                 exit_price_raw = float(frame_px.loc[date, "close"])
 
-                exit_adv = self._adv_for_order(history, pos.code, date)
+                exit_adv = adv_map.get(
+                    (str(pos.code), date),
+                    float("nan"),
+                )
                 if self.require_liquidity_data and not self._is_valid_adv(exit_adv):
                     deferred_positions.append(pos)
                     continue
@@ -749,7 +791,10 @@ class PortfolioBacktester:
                     )
                     continue
 
-                adv = self._adv_for_order(history, code, date)
+                adv = adv_map.get(
+                    (code, date),
+                    float("nan"),
+                )
 
                 if self.require_liquidity_data and not self._is_valid_adv(adv):
                     rejected_orders.append(
@@ -821,7 +866,13 @@ class PortfolioBacktester:
             # --- 4. open new positions ---
             for cand in selected:
                 pos = Position(
-                    position_id=uuid.uuid4().hex[:12],
+                    position_id=self._make_position_id(
+                        entry_date=date,
+                        code=cand["code"],
+                        side=cand["side"],
+                        qty=cand["qty"],
+                        sequence=position_sequence,
+                    ),
                     code=cand["code"],
                     name=cand["name"],
                     side=cand["side"],
@@ -834,6 +885,8 @@ class PortfolioBacktester:
                     score=cand["score"],
                     last_carry_date=date,
                 )
+
+                position_sequence += 1
 
                 if cand["side"] == "BUY":
                     cash -= cand["entry_price"] * cand["qty"]

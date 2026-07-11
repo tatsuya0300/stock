@@ -152,15 +152,12 @@ def validate_daily_coverage(
     ]
     price_codes = set(price_ok["code"])
 
-    turnover_ok = target_rows[
-        np.isfinite(target_rows["turnover"])
-        & (target_rows["turnover"] > 0)
-    ]
+    turnover_ok = target_rows[np.isfinite(target_rows["turnover"]) & (target_rows["turnover"] > 0)]
     turnover_codes = set(turnover_ok["code"])
 
     # target_date 以前に lookback 営業日以上があるか
     history = x[x["date"] < pd.Timestamp(target_date)]
-    required_bars = max(lookback, adv_window)
+    required_bars = max(lookback, min_adv_periods)
     lookback_codes = set(
         history.groupby("code")
         .filter(lambda g: len(g) >= required_bars)["code"]
