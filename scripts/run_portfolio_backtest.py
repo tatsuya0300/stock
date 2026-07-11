@@ -24,6 +24,7 @@ from jp_signal.order_builder import signals_to_orders
 from jp_signal.portfolio import PortfolioBacktester
 from jp_signal.portfolio_metrics import summarize_portfolio_ledger
 from jp_signal.risk import risk_config_from_dict
+from jp_signal.snapshot import write_backtest_input_snapshot
 from jp_signal.storage import Storage
 from jp_signal.universe import load_universe
 
@@ -140,6 +141,29 @@ def main() -> None:
 
     prices = prices.copy()
     prices["_date_ts"] = pd.to_datetime(prices["date"])
+
+    # バックテスト開始前に入力データのスナップショットを保存
+    snapshot_dir = cfg.get("backtest", {}).get(
+        "snapshot_dir",
+        os.path.join(
+            cfg.get("backtest", {}).get("output_dir", "./data/bt_out"),
+            "input_snapshot",
+        ),
+    )
+    try:
+        snapshot_meta = write_backtest_input_snapshot(
+            output_dir=snapshot_dir,
+            prices=prices,
+            shortability=shortability if not shortability.empty else None,
+            universe_file=cfg["universe"]["file"],
+        )
+        print(
+            f"入力スナップショット: {snapshot_meta['prices']['rows']}行"
+            f" / {snapshot_meta['shortability']['rows']}行"
+            f" / SHA256: {snapshot_meta['metadata_sha256'][:16]}..."
+        )
+    except Exception as exc:
+        print(f"スナップショット保存に失敗しました（続行します）: {exc}")
 
     all_dates = sorted(pd.to_datetime(prices["date"]).strftime("%Y-%m-%d").unique())
     all_dates = [d for d in all_dates if cfg["backtest"]["start"] <= d <= cfg["backtest"]["end"]]
