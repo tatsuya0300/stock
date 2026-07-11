@@ -144,6 +144,31 @@ _ORDER_COLUMNS = [
     "holding_days",
 ]
 
+_LIVE_ORDER_COLUMNS = [
+    "code",
+    "name",
+    "side",
+    "order_type",
+    "qty",
+    "ref_price",
+    "value_yen",
+    "score",
+    "warn",
+    "shortable",
+]
+
+
+def _order_columns(*, for_backtest: bool) -> list[str]:
+    """live/BTの注文出力スキーマを返す。
+
+    live注文にはバックテスト専用列を含めない。
+    これにより、for_backtest=Falseで存在しない列を選択して
+    KeyErrorになることを防ぐ。
+    """
+    if for_backtest:
+        return list(_ORDER_COLUMNS)
+    return list(_LIVE_ORDER_COLUMNS)
+
 
 @dataclass(frozen=True)
 class OrderBuildResult:
@@ -186,8 +211,12 @@ _REJECTION_COLUMNS = [
 ]
 
 
-def _empty_orders() -> pd.DataFrame:
-    return pd.DataFrame(columns=_ORDER_COLUMNS)
+def _empty_orders(*, for_backtest: bool = False) -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=_order_columns(
+            for_backtest=for_backtest,
+        )
+    )
 
 
 def _empty_rejections() -> pd.DataFrame:
@@ -213,7 +242,9 @@ def build_orders_with_audit(
     """シグナルを注文へ変換し、採用・不採用を全て返す。"""
     if signals is None or signals.empty:
         return OrderBuildResult(
-            selected=_empty_orders(),
+            selected=_empty_orders(
+                for_backtest=for_backtest,
+            ),
             rejected=_empty_rejections(),
             diagnostics={
                 "signal_count": 0,
@@ -231,7 +262,9 @@ def build_orders_with_audit(
             if col not in rejected.columns:
                 rejected[col] = None
         return OrderBuildResult(
-            selected=_empty_orders(),
+            selected=_empty_orders(
+                for_backtest=for_backtest,
+            ),
             rejected=rejected[_REJECTION_COLUMNS],
             diagnostics={
                 "signal_count": len(signals),
@@ -251,7 +284,9 @@ def build_orders_with_audit(
             if col not in rejected.columns:
                 rejected[col] = None
         return OrderBuildResult(
-            selected=_empty_orders(),
+            selected=_empty_orders(
+                for_backtest=for_backtest,
+            ),
             rejected=rejected[_REJECTION_COLUMNS],
             diagnostics={
                 "signal_count": len(signals),
@@ -393,7 +428,9 @@ def build_orders_with_audit(
 
     if not candidate_rows:
         return OrderBuildResult(
-            selected=_empty_orders(),
+            selected=_empty_orders(
+                for_backtest=for_backtest,
+            ),
             rejected=pd.DataFrame(rejected_rows) if rejected_rows else _empty_rejections(),
             diagnostics={
                 "signal_count": len(signals),
@@ -422,8 +459,26 @@ def build_orders_with_audit(
         rec["reason"] = str(rejected_candidate.get("reason", "RISK_REJECTED"))
         rejected_rows.append(rec)
 
-    # 列を統一して返す
-    selected_out = selected[_ORDER_COLUMNS] if not selected.empty else _empty_orders()
+    # live/BTごとの出力スキーマで返す。
+    output_columns = _order_columns(
+        for_backtest=for_backtest,
+    )
+
+    if selected.empty:
+        selected_out = _empty_orders(
+            for_backtest=for_backtest,
+        )
+    else:
+        missing_output_columns = set(output_columns) - set(selected.columns)
+
+        if missing_output_columns:
+            raise RuntimeError(
+                "selected orders missing output columns: "
+                f"{sorted(missing_output_columns)}"
+            )
+
+        selected_out = selected[output_columns].copy()
+
     rejected_out = (
         pd.DataFrame(rejected_rows)[_REJECTION_COLUMNS] if rejected_rows else _empty_rejections()
     )
