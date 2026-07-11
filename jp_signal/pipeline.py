@@ -50,9 +50,7 @@ def _morning_decision_at(
         )
     )
 
-    decision_time = time.fromisoformat(
-        raw_time
-    )
+    decision_time = time.fromisoformat(raw_time)
 
     timestamp = datetime.combine(
         as_of,
@@ -61,6 +59,7 @@ def _morning_decision_at(
     )
 
     return pd.Timestamp(timestamp)
+
 
 # 初回取得時の過去日数（足りなければ随時追加）
 _INITIAL_HISTORY_CALENDAR_DAYS = 400
@@ -182,7 +181,7 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
     enforce_short_policy_for_live(cfg)
 
     run_id = uuid.uuid4().hex[:12]
-    storage: Storage | None = Storage(cfg["data"]["db_path"]) if not dry_run else None
+    storage: Storage = Storage(cfg["data"]["db_path"], read_only=dry_run)
     ds = make_datasource(cfg)
     univ = load_universe(cfg["universe"], as_of=str(as_of))
     codes = univ["code"].tolist()
@@ -199,7 +198,9 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
 
     try:
         source_name = cfg.get("data", {}).get("source", "unknown")
-        df = _fetch_prices_incremental(ds, storage, codes, as_of, dry_run=dry_run, source_name=source_name)
+        df = _fetch_prices_incremental(
+            ds, storage, codes, as_of, dry_run=dry_run, source_name=source_name
+        )
         if df.empty:
             notifier.send("本日はシグナル生成不可", "データ取得失敗")
             return pd.DataFrame()
@@ -237,25 +238,18 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
         )
 
         shortability_df = pd.DataFrame()
-        if not dry_run and storage is not None:
-            shortability_df = (
-                storage.load_shortability_observations(
-                    codes,
-                    available_before=decision_at,
-                    available_after=(
-                        decision_at
-                        - pd.Timedelta(days=30)
-                    ),
-                )
+        if not dry_run:
+            shortability_df = storage.load_shortability_observations(
+                codes,
+                available_before=decision_at,
+                available_after=(decision_at - pd.Timedelta(days=30)),
             )
 
             # PITデータが無ければlegacy tableへfallback
             if shortability_df.empty:
                 shortability_df = storage.load_shortability(
                     codes,
-                    start=str(
-                        as_of - timedelta(days=30)
-                    ),
+                    start=str(as_of - timedelta(days=30)),
                     end=str(as_of),
                 )
 
@@ -268,7 +262,7 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
             notifier.send("本日はシグナル生成不可", "シグナル0件")
             return pd.DataFrame()
 
-        if not dry_run and storage is not None:
+        if not dry_run:
             storage.append_signals(
                 run_id=run_id,
                 signals=sig,
@@ -301,7 +295,7 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
 
         orders = order_result.selected
 
-        if not dry_run and storage is not None and not order_result.rejected.empty:
+        if not dry_run and not order_result.rejected.empty:
             storage.append_order_rejections(
                 run_id=run_id,
                 rejection_date=str(as_of),
@@ -326,7 +320,7 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
                 n_sell,
             )
 
-        if not dry_run and storage is not None:
+        if not dry_run:
             orders["order_date"] = str(as_of)
             orders["signal_asof_date"] = str(as_of)
             storage.append_orders(run_id, orders)
@@ -339,8 +333,7 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
         return orders
 
     finally:
-        if not dry_run and storage is not None:
-            storage.close()
+        storage.close()
 
 
 def closing_pipeline(
@@ -361,16 +354,14 @@ def closing_pipeline(
         log.info("non-business day: %s", as_of)
         return {"orders": 0, "fills_imported": 0}
 
-    storage: Storage | None = Storage(cfg["data"]["db_path"]) if not dry_run else None
+    storage = Storage(cfg["data"]["db_path"], read_only=dry_run)
     notifier = make_notifier(cfg)
     as_of_s = str(as_of)
     result = {"orders": 0, "fills_imported": 0}
 
     try:
-        orders_df = pd.DataFrame()
-        if storage is not None:
-            orders_df = storage.load_orders(order_date=as_of_s)
-            result["orders"] = len(orders_df)
+        orders_df = storage.load_orders(order_date=as_of_s)
+        result["orders"] = len(orders_df)
 
         if orders_df.empty:
             body = "当日注文なし（または DB 未接続）"
@@ -381,7 +372,7 @@ def closing_pipeline(
         notifier.send(f"{title_prefix}引け後確認 {as_of}", body)
 
         # fills 取込
-        if fills_csv is not None and storage is not None and not dry_run:
+        if fills_csv is not None and not dry_run:
             n = storage.import_fills_csv(fills_csv)
             result["fills_imported"] = n
             fills_today = storage.load_fills(trade_date=as_of_s)
@@ -403,5 +394,4 @@ def closing_pipeline(
 
         return result
     finally:
-        if storage is not None:
-            storage.close()
+        storage.close()
