@@ -116,19 +116,39 @@ def is_shortable_asof(
 
 
 def _ref_rows_before(prices: pd.DataFrame, as_of: date | str) -> pd.DataFrame:
-    """寄前想定: as_of 当日終値は未確定のため前営業日以前の最終行を使う。
+    """寄前時点で利用可能な直近価格を銘柄別に返す。
 
-    code 列は正規化してインデックスとして使用する。
-    呼び出し側でも正規化済みの code でアクセスすること。
+    as_of当日の価格は使用せず、前営業日以前のデータだけを利用する。
+    date列は文字列・Timestampのどちらも受け付ける。
     """
+    required = {"code", "date"}
+    missing = required - set(prices.columns)
+    if missing:
+        raise ValueError(f"prices missing columns: {sorted(missing)}")
+
     as_of_d = pd.Timestamp(as_of).date()
-    cutoff = previous_business_day(as_of_d).isoformat()
-    prev = prices.copy()
-    prev["code"] = prev["code"].astype(str).str.strip()
-    prev = prev[prev["date"] <= cutoff].sort_values("date")
-    if prev.empty:
+    cutoff = pd.Timestamp(previous_business_day(as_of_d))
+
+    previous = prices.copy()
+    previous["code"] = (
+        previous["code"]
+        .astype(str)
+        .str.strip()
+    )
+    previous["date"] = pd.to_datetime(
+        previous["date"],
+        errors="coerce",
+    ).dt.normalize()
+
+    previous = previous.dropna(subset=["date"])
+    previous = previous[
+        previous["date"] <= cutoff
+    ].sort_values("date")
+
+    if previous.empty:
         return pd.DataFrame()
-    return prev.groupby("code").tail(1).set_index("code")
+
+    return previous.groupby("code").tail(1).set_index("code")
 
 
 _ORDER_COLUMNS = [

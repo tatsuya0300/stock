@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 
 import pandas as pd
 
@@ -367,6 +368,11 @@ def apply_order_risk_limits(
     select_orders_with_reasons() を使用する。
     """
     return select_orders_with_reasons(
+        orders,
+        risk,
+        score_col=score_col,
+    ).selected
+return select_orders_with_reasons(
         orders,
         risk,
         score_col=score_col,
