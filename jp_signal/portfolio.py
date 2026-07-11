@@ -62,6 +62,18 @@ class PortfolioResult:
     rejected_orders: pd.DataFrame
     daily_ledger: pd.DataFrame
     open_positions: pd.DataFrame
+    deferred_exits: pd.DataFrame
+
+    @staticmethod
+    def _empty_result() -> PortfolioResult:
+        empty = pd.DataFrame()
+        return PortfolioResult(
+            trades=empty,
+            rejected_orders=empty,
+            daily_ledger=empty,
+            open_positions=empty,
+            deferred_exits=empty,
+        )
 
 
 class PortfolioBacktester:
@@ -572,13 +584,7 @@ class PortfolioBacktester:
         corporate_actions: list[CorporateAction] | None = None,
     ) -> PortfolioResult:
         if orders is None or orders.empty:
-            empty = pd.DataFrame()
-            return PortfolioResult(
-                trades=empty,
-                rejected_orders=empty,
-                daily_ledger=empty,
-                open_positions=empty,
-            )
+            return self._empty_result()
 
         px = self._prepare_prices(prices)
         od = self._prepare_orders(orders)
@@ -606,19 +612,14 @@ class PortfolioBacktester:
             trading_dates = [d for d in trading_dates if d <= end_ts]
 
         if not trading_dates:
-            empty = pd.DataFrame()
-            return PortfolioResult(
-                trades=empty,
-                rejected_orders=empty,
-                daily_ledger=empty,
-                open_positions=empty,
-            )
+            return self._empty_result()
 
         # state
         cash = self.initial_capital
         positions: list[Position] = []
         trades: list[dict] = []
         rejected_orders: list[dict] = []
+        deferred_exits: list[dict] = []
         daily_ledger: list[dict] = []
         position_sequence = 0
 
@@ -631,7 +632,10 @@ class PortfolioBacktester:
             day_ca = ca_grouped.get(date_str, [])
             if day_ca:
                 positions, cash = _apply_corporate_actions(
-                    positions, day_ca, date_str, cash,
+                    positions,
+                    day_ca,
+                    date_str,
+                    cash,
                     ledger=daily_ledger,
                 )
 
@@ -737,13 +741,14 @@ class PortfolioBacktester:
             positions = remaining_positions + deferred_positions
 
             for dpos in deferred_positions:
-                rejected_orders.append(
+                deferred_exits.append(
                     {
                         "code": dpos.code,
                         "name": dpos.name,
                         "side": dpos.side,
                         "qty": dpos.qty,
-                        "rejection_date": str(date.date()),
+                        "deferred_date": str(date.date()),
+                        "planned_exit_date": str(dpos.planned_exit_date.date()),
                         "reason": "NO_EXIT_PRICE_DEFERRED",
                     }
                 )
@@ -944,6 +949,7 @@ class PortfolioBacktester:
             open_positions=(
                 pd.DataFrame([asdict(p) for p in positions]) if positions else pd.DataFrame()
             ),
+            deferred_exits=(pd.DataFrame(deferred_exits) if deferred_exits else pd.DataFrame()),
         )
 
         return result

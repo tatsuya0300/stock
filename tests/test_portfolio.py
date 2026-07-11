@@ -409,7 +409,8 @@ def test_missing_exact_exit_price_defers_exit():
     assert trade["planned_exit_date"] == "2024-01-04"
     assert trade["exit_date"] == "2024-01-05"
 
-    assert "NO_EXIT_PRICE_DEFERRED" in set(result.rejected_orders["reason"])
+    assert len(result.deferred_exits) == 1
+    assert result.deferred_exits.iloc[0]["reason"] == "NO_EXIT_PRICE_DEFERRED"
 
 
 def test_unsupported_order_type_is_rejected():
