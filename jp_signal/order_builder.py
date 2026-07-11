@@ -115,10 +115,16 @@ def is_shortable_asof(
 
 
 def _ref_rows_before(prices: pd.DataFrame, as_of: date | str) -> pd.DataFrame:
-    """寄前想定: as_of 当日終値は未確定のため前営業日以前の最終行を使う。"""
+    """寄前想定: as_of 当日終値は未確定のため前営業日以前の最終行を使う。
+
+    code 列は正規化してインデックスとして使用する。
+    呼び出し側でも正規化済みの code でアクセスすること。
+    """
     as_of_d = pd.Timestamp(as_of).date()
     cutoff = previous_business_day(as_of_d).isoformat()
-    prev = prices[prices["date"] <= cutoff].sort_values("date")
+    prev = prices.copy()
+    prev["code"] = prev["code"].astype(str).str.strip()
+    prev = prev[prev["date"] <= cutoff].sort_values("date")
     if prev.empty:
         return pd.DataFrame()
     return prev.groupby("code").tail(1).set_index("code")
