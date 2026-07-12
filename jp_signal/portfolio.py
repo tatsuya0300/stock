@@ -429,11 +429,17 @@ class PortfolioBacktester:
         self,
         candidates: list[dict],
         base: dict[str, float],
+        *,
+        equity_at_open: float | None = None,
+        maintain_margin_ratio: float | None = None,
     ) -> tuple[list[dict], list[tuple[dict, str]]]:
         """既存建玉を含めて注文を選択する。
 
         gross/long/shortを先に判定し、netはlong-shortの
         バッチ全体で判定する。
+
+        オプションで equity_at_open と maintain_margin_ratio を渡すと
+        信用保証金率（equity_to_gross_ratio）による制約も評価する。
         """
         selected: list[dict] = []
         rejected: list[tuple[dict, str]] = []
@@ -466,15 +472,24 @@ class PortfolioBacktester:
             else:
                 next_short += value
 
+            next_gross = next_long + next_short
+
             if next_long > self.risk.max_long_exposure_yen:
                 rejected.append((candidate, "LONG_LIMIT"))
                 continue
             if next_short > self.risk.max_short_exposure_yen:
                 rejected.append((candidate, "SHORT_LIMIT"))
                 continue
-            if next_long + next_short > self.risk.max_gross_exposure_yen:
+            if next_gross > self.risk.max_gross_exposure_yen:
                 rejected.append((candidate, "GROSS_LIMIT"))
                 continue
+
+            # 信用保証金率チェック
+            if equity_at_open is not None and maintain_margin_ratio is not None and next_gross > 0:
+                next_equity_to_gross = equity_at_open / next_gross
+                if next_equity_to_gross < maintain_margin_ratio:
+                    rejected.append((candidate, "MARGIN_BREACH"))
+                    continue
 
             selected.append(candidate)
             long_value = next_long
@@ -633,6 +648,9 @@ class PortfolioBacktester:
                         "open_position_count": 0,
                         "accrued_carry": 0.0,
                         "nav": self.initial_capital,
+                        "equity_to_gross_ratio": None,
+                        "minimum_equity_to_gross_ratio": self.maintain_margin_ratio,
+                        "margin_breach": False,
                     }
                     for day in trading_dates
                 ]
@@ -673,18 +691,8 @@ class PortfolioBacktester:
                 )
                 corporate_action_events.extend(ca_events)
 
-            # --- 1. accrue carry on existing positions ---
-            positions = self._accrue_carry(
-                positions,
-                date,
-                self.daily_interest,
-                self.daily_lending,
-            )
-
-            # --- 1b. save positions before closing for open-time risk check ---
-            pre_close_positions = positions[:]
-
-            # --- 2. close positions whose planned_exit_date <= date ---
+            # --- 1. close positions whose planned_exit_date <= date ---
+            # NOTE: carry accrual は決済後に行う（決済ポジションのcarryは決済時に計上）
             closing_positions: list[Position] = []
             remaining_positions: list[Position] = []
 
@@ -694,6 +702,8 @@ class PortfolioBacktester:
                 else:
                     remaining_positions.append(pos)
 
+            # 決済予定ポジションも含めてexisting_codesチェック用に保存
+            pre_close_positions = positions[:]
             positions = remaining_positions
 
             deferred_positions: list[Position] = []
@@ -724,6 +734,15 @@ class PortfolioBacktester:
                 if self.require_liquidity_data and not self._is_valid_adv(exit_adv):
                     deferred_positions.append(pos)
                     continue
+
+                # 決済前に決済ポジションのcarryを計上（last_carry_date から決済日まで）
+                cal_days = (date - pos.last_carry_date).days
+                if cal_days > 0:
+                    rate = self.daily_lending if pos.side == "SELL" else self.daily_interest
+                    carry = pos.entry_price * rate * cal_days * pos.qty
+                    pos.accrued_carry += carry
+                    pos.accrued_carry_days += cal_days
+                    pos.last_carry_date = date
 
                 direction = -self._side_sign(pos.side)
                 exit_price, exit_slippage_bp = self._execution_price(
@@ -773,6 +792,14 @@ class PortfolioBacktester:
                 )
 
             positions = remaining_positions + deferred_positions
+
+            # --- 2. accrue carry on remaining positions (after closing) ---
+            positions = self._accrue_carry(
+                positions,
+                date,
+                self.daily_interest,
+                self.daily_lending,
+            )
 
             for dpos in deferred_positions:
                 rejected_orders.append(
@@ -907,9 +934,48 @@ class PortfolioBacktester:
                     }
                 )
 
-            # 寄付き時点のリスク判定: 当日引けで決済予定のポジションも含める
-            base_exposure = self._exposure_at_open(pre_close_positions, history, date)
-            selected, day_rejected = self._select_orders(candidates, base_exposure)
+            # --- 4. compute open equity for risk check ---
+            # 決済後のポジションのみで寄付き時点のエクスポージャーを計算
+            open_exposure = self._exposure_at_open(positions, history, date)
+            cash_at_open = cash
+            open_accrued_carry = sum(p.accrued_carry for p in positions)
+            equity_at_open = cash_at_open + open_exposure["long"] - open_exposure["short"] - open_accrued_carry
+
+            # equity_at_open の妥当性検証
+            if not (np.isfinite(equity_at_open) and equity_at_open >= 0):
+                rejected_orders.append(
+                    {
+                        "code": "SYSTEM",
+                        "name": "",
+                        "side": "",
+                        "qty": 0,
+                        "rejection_date": str(date.date()),
+                        "reason": f"INVALID_EQUITY_AT_OPEN: {equity_at_open}",
+                    }
+                )
+                # equity が不正な場合は全注文を不採用にする
+                for cand in candidates:
+                    rejected_orders.append(
+                        {
+                            "code": cand["code"],
+                            "name": cand.get("name", ""),
+                            "side": cand["side"],
+                            "qty": cand["qty"],
+                            "entry_price": cand["entry_price"],
+                            "score": cand["score"],
+                            "rejection_date": str(date.date()),
+                            "reason": "INVALID_EQUITY",
+                        }
+                    )
+                selected: list[dict] = []
+                day_rejected: list = []
+            else:
+                selected, day_rejected = self._select_orders(
+                    candidates,
+                    open_exposure,
+                    equity_at_open=equity_at_open,
+                    maintain_margin_ratio=self.maintain_margin_ratio,
+                )
 
             for candidate, reason in day_rejected:
                 rejected_orders.append(
@@ -925,7 +991,7 @@ class PortfolioBacktester:
                     }
                 )
 
-            # --- 4. open new positions ---
+            # --- 5. open new positions ---
             for cand in selected:
                 pos = Position(
                     position_id=self._make_position_id(
@@ -956,10 +1022,16 @@ class PortfolioBacktester:
                     cash += cand["entry_price"] * cand["qty"]
                 positions.append(pos)
 
-            # --- 5. record daily ledger ---
+            # --- 6. record daily ledger ---
             exposure = self._exposure(positions, history, date)
             total_accrued_carry = sum(p.accrued_carry for p in positions)
             nav = cash + exposure["long"] - exposure["short"] - total_accrued_carry
+
+            equity_to_gross_ratio: float | None = None
+            margin_breach: bool = False
+            if exposure["gross"] > 0 and np.isfinite(equity_at_open) and equity_at_open >= 0:
+                equity_to_gross_ratio = equity_at_open / exposure["gross"]
+                margin_breach = equity_to_gross_ratio < self.maintain_margin_ratio
 
             daily_ledger.append(
                 {
@@ -972,6 +1044,9 @@ class PortfolioBacktester:
                     "open_position_count": len(positions),
                     "accrued_carry": total_accrued_carry,
                     "nav": nav,
+                    "equity_to_gross_ratio": equity_to_gross_ratio,
+                    "minimum_equity_to_gross_ratio": self.maintain_margin_ratio,
+                    "margin_breach": margin_breach,
                 }
             )
 
