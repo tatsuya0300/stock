@@ -635,6 +635,25 @@ class Storage:
         """
         return pd.read_sql(q, self.conn, params=[*codes, start, end, asof_date])
 
+    def load_prices_for_backtest(
+        self,
+        codes: list[str],
+        start: str,
+        end: str,
+        *,
+        decision_at: str | None = None,
+        vintage_mode: str = "latest_snapshot",
+    ) -> pd.DataFrame:
+        if vintage_mode == "latest_snapshot":
+            return self.load_prices(codes, start, end)
+        if vintage_mode == "point_in_time":
+            if decision_at is None:
+                raise ValueError("decision_at is required when vintage_mode='point_in_time'")
+            return self.load_prices_asof(
+                asof_date=decision_at, codes=codes, start=start, end=end,
+            )
+        raise ValueError(f"unsupported price vintage mode: {vintage_mode!r}")
+
     def upsert_shortability(self, df: pd.DataFrame) -> None:
         if df is None or df.empty:
             return
