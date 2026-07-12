@@ -10,6 +10,7 @@ import pytest
 
 from jp_signal.shortability_provider import (
     CsvShortabilityDataSource,
+    CsvShortabilityProvider,
     ShortabilityDataSource,
     refresh_shortability,
 )
@@ -86,3 +87,63 @@ def test_refresh_shortability():
         assert len(result) == 1
     finally:
         Path(path).unlink(missing_ok=True)
+
+
+def test_csv_shortability_provider(
+    tmp_path,
+):
+    path = (
+        tmp_path
+        / "shortability.csv"
+    )
+
+    pd.DataFrame(
+        [
+            {
+                "code": "7203",
+                "effective_at": (
+                    "2026-07-13T07:00:00"
+                    "+09:00"
+                ),
+                "short_type": "system",
+                "is_shortable": 1,
+                "is_margin_lendable": 1,
+                "short_restricted": 0,
+                "stock_loan_fee_annual": 0.02,
+            }
+        ]
+    ).to_csv(
+        path,
+        index=False,
+    )
+
+    provider = CsvShortabilityProvider(
+        path,
+        default_source="test",
+    )
+
+    result = provider.fetch(
+        fetched_at=pd.Timestamp(
+            "2026-07-13T07:30:00"
+            "+09:00"
+        )
+    )
+
+    assert len(result) == 1
+
+    row = result.iloc[0]
+
+    assert row["code"] == "7203"
+    assert row["short_type"] == "system"
+    assert row["is_shortable"] == 1
+    assert row["is_margin_lendable"] == 1
+    assert row["short_restricted"] == 0
+
+    assert (
+        row["available_at"]
+        >= row["effective_at"]
+    )
+    assert (
+        row["available_at"]
+        >= row["fetched_at"]
+    )
