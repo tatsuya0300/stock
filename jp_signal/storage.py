@@ -1,6 +1,6 @@
 """SQLite 永続化レイヤ。
 
-schema v4:
+schema v5:
 - raw OHLC と adjusted OHLC を分離
 - signals/orders/fills を追加
 - signals/orders に PRIMARY KEY を追加し ON CONFLICT DO UPDATE を有効化
@@ -9,6 +9,9 @@ schema v4:
 - order_rejections テーブル (v3)
 - price_observations テーブル（取得時刻・revision履歴）(v4)
 - record_price_observations() / ingest_prices()
+- price_observation_values テーブル（全OHLCカラム + revision）(v5)
+- load_prices_asof() — ポイントインタイム価格読み出し
+- price_vintage_mode: latest_snapshot / point_in_time
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _sha256_file(path: str | Path) -> str:
@@ -174,6 +177,34 @@ CREATE TABLE IF NOT EXISTS price_observations (
 
 CREATE INDEX IF NOT EXISTS idx_price_observations_lookup
 ON price_observations(code, date, source);
+
+CREATE TABLE IF NOT EXISTS price_observation_values (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL,
+    date TEXT NOT NULL,
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    adj_open REAL,
+    adj_high REAL,
+    adj_low REAL,
+    adj_close REAL,
+    volume REAL,
+    turnover REAL,
+    payload_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(code, date, source, payload_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pov_pit_lookup
+ON price_observation_values(code, date, available_at);
+
+CREATE INDEX IF NOT EXISTS idx_pov_fetched
+ON price_observation_values(code, date, fetched_at);
 
 CREATE TABLE IF NOT EXISTS shortability_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -423,6 +454,87 @@ class Storage:
                 available_at=available_at,
             )
 
+    def _upsert_price_observation_values_no_commit(
+        self,
+        df: pd.DataFrame,
+        *,
+        source: str,
+        available_at: str | None = None,
+    ) -> None:
+        """プライベートメソッド: price_observation_values に全OHLC行を挿入する。
+
+        各(code, date) の最新 revision を fetched_at 順で管理する。
+        同一 payload_hash の行はスキップする（重複排除）。
+        呼び出し側トランザクション内で使用すること。
+        """
+        if df is None or df.empty:
+            return
+
+        fetched_at = _utc_now_iso()
+        if available_at is None:
+            available_at = fetched_at
+
+        x = df.copy()
+        for c in ["adj_open", "adj_high", "adj_low", "adj_close"]:
+            if c not in x.columns:
+                if c == "adj_close":
+                    x[c] = x["close"]
+                else:
+                    x[c] = x[c.replace("adj_", "")]
+
+        x["code"] = x["code"].astype(str).str.strip()
+        x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")
+
+        pov_cols = [
+            "code", "date", "open", "high", "low", "close",
+            "adj_open", "adj_high", "adj_low", "adj_close",
+            "volume", "turnover",
+        ]
+        x = x[pov_cols]
+
+        sql = """
+        INSERT INTO price_observation_values (
+            code, date, source, fetched_at, available_at,
+            open, high, low, close,
+            adj_open, adj_high, adj_low, adj_close,
+            volume, turnover, payload_hash
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        records: list[tuple] = []
+        for _, row in x.iterrows():
+            row_dict = row.to_dict()
+            payload_hash = _price_payload_hash(row_dict)
+            records.append(
+                (
+                    str(row_dict["code"]),
+                    str(row_dict["date"]),
+                    source,
+                    fetched_at,
+                    available_at,
+                    row_dict.get("open"),
+                    row_dict.get("high"),
+                    row_dict.get("low"),
+                    row_dict.get("close"),
+                    row_dict.get("adj_open"),
+                    row_dict.get("adj_high"),
+                    row_dict.get("adj_low"),
+                    row_dict.get("adj_close"),
+                    row_dict.get("volume"),
+                    row_dict.get("turnover"),
+                    payload_hash,
+                )
+            )
+
+        # 同一 payload_hash の行はスキップするため INSERT OR IGNORE
+        insert_sql = sql.replace(
+            "INSERT INTO",
+            "INSERT OR IGNORE INTO",
+        )
+        for r in records:
+            self.conn.execute(insert_sql, r)
+
     def ingest_prices(
         self,
         df: pd.DataFrame,
@@ -430,11 +542,12 @@ class Storage:
         source: str,
         available_at: str | None = None,
     ) -> None:
-        """価格データの取込（リビジョン記録 + 最新投影の更新）を一括で行う。
+        """価格データの取込（リビジョン記録 + price_observation_values + 最新投影）を一括で行う。
 
         同一トランザクション内で以下を実行:
         1. record_price_observations() — リビジョン履歴の保存
-        2. upsert_prices() — prices テーブルの最新値更新
+        2. _upsert_price_observation_values_no_commit() — 全OHLC行の保存
+        3. upsert_prices() — prices テーブルの最新値更新
 
         Args:
             df: 価格データフレーム（PRICE_COLS を含む）
@@ -446,6 +559,11 @@ class Storage:
 
         with self.conn:
             self._record_price_observations_no_commit(
+                df,
+                source=source,
+                available_at=available_at,
+            )
+            self._upsert_price_observation_values_no_commit(
                 df,
                 source=source,
                 available_at=available_at,
@@ -465,6 +583,57 @@ class Storage:
         ORDER BY code, date
         """
         return pd.read_sql(q, self.conn, params=[*codes, start, end])
+
+    def load_prices_asof(
+        self,
+        asof_date: str,
+        codes: list[str],
+        start: str,
+        end: str,
+    ) -> pd.DataFrame:
+        """ポイントインタイム: 指定時刻時点で利用可能だった最新リビジョンの価格を読む。
+
+        price_observation_values から、asof_date 以前に利用可能（available_at <= asof_date）
+        となった各行のうち、fetched_at が最大のものを各 (code, date) について返す。
+
+        Args:
+            asof_date: 基準時刻（ISO 8601）。この時刻までに利用可能になったデータのみ使用。
+            codes: 取得する銘柄コード一覧。
+            start: 開始日（YYYY-MM-DD）。
+            end: 終了日（YYYY-MM-DD）。
+
+        Returns:
+            PRICE_COLS を含む DataFrame。
+        """
+        if not codes:
+            return pd.DataFrame(columns=PRICE_COLS)
+        codes = [str(c) for c in codes]
+        placeholders = ",".join("?" * len(codes))
+
+        q = f"""
+        WITH ranked AS (
+            SELECT
+                code, date, open, high, low, close,
+                adj_open, adj_high, adj_low, adj_close,
+                volume, turnover,
+                ROW_NUMBER() OVER (
+                    PARTITION BY code, date
+                    ORDER BY fetched_at DESC
+                ) AS rn
+            FROM price_observation_values
+            WHERE code IN ({placeholders})
+              AND date BETWEEN ? AND ?
+              AND available_at <= ?
+        )
+        SELECT
+            code, date, open, high, low, close,
+            adj_open, adj_high, adj_low, adj_close,
+            volume, turnover
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY code, date
+        """
+        return pd.read_sql(q, self.conn, params=[*codes, start, end, asof_date])
 
     def upsert_shortability(self, df: pd.DataFrame) -> None:
         if df is None or df.empty:
