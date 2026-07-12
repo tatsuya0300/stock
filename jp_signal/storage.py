@@ -1,6 +1,7 @@
 """SQLite 永続化レイヤ。
 
-schema v5:
+schema v6:
+- fills v6 migration columns (exit_date, exit_price, exit_slippage_bp, holding_days, carry_cost, carry_days, pnl)
 - raw OHLC と adjusted OHLC を分離
 - signals/orders/fills を追加
 - signals/orders に PRIMARY KEY を追加し ON CONFLICT DO UPDATE を有効化
@@ -24,7 +25,7 @@ from pathlib import Path
 
 import pandas as pd
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _sha256_file(path: str | Path) -> str:
