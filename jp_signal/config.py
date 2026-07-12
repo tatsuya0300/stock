@@ -49,6 +49,11 @@ _DEFAULT_DATA = {
 
     # yfinance の一括取得銘柄数
     "yfinance_chunk_size": 50,
+
+    # 価格データの取得モード
+    #   latest_snapshot — prices テーブルから常に最新のスナップショットを読む
+    #   point_in_time   — price_observation_values から指定時刻時点のリビジョンを読む
+    "price_vintage_mode": "latest_snapshot",
 }
 
 _DEFAULT_BACKTEST = {
@@ -278,6 +283,14 @@ def _validate_config_values(cfg: dict) -> None:
     yfinance_chunk_size = _as_int(data, "yfinance_chunk_size", section="data", default=50)
     if yfinance_chunk_size < 1:
         raise ConfigError(f"data.yfinance_chunk_size は1以上である必要があります: {yfinance_chunk_size}")
+
+    price_vintage_mode = str(data.get("price_vintage_mode", "latest_snapshot"))
+    valid_modes = ("latest_snapshot", "point_in_time")
+    if price_vintage_mode not in valid_modes:
+        raise ConfigError(
+            f"data.price_vintage_mode は {valid_modes} のいずれかである必要があります: "
+            f"{price_vintage_mode!r}"
+        )
 
     if "start" in backtest and "end" in backtest:
         try:
