@@ -36,6 +36,8 @@ class RiskConfig:
         max_net_exposure_yen: float = 5_000_000.0,
         require_both_sides: bool = True,
         allow_short_without_confirmed_shortability: bool = False,
+        selection_method: str = "greedy",
+        allow_optimizer_fallback: bool = False,
     ):
         if max_orders_per_day < 1:
             raise ValueError(f"max_orders_per_day must be >= 1: {max_orders_per_day}")
@@ -57,6 +59,13 @@ class RiskConfig:
             if numeric_value < 0:
                 raise ValueError(f"{name} must be >= 0: {value}")
 
+        normalized_method = str(selection_method).strip().lower()
+        if normalized_method not in {"greedy", "milp"}:
+            raise ValueError(
+                "selection_method must be 'greedy' or 'milp': "
+                f"{selection_method!r}"
+            )
+
         self.max_orders_per_day = int(max_orders_per_day)
         self.max_gross_exposure_yen = float(max_gross_exposure_yen)
         self.max_single_name_exposure_yen = float(max_single_name_exposure_yen)
@@ -67,6 +76,8 @@ class RiskConfig:
         self.allow_short_without_confirmed_shortability = bool(
             allow_short_without_confirmed_shortability
         )
+        self.selection_method = normalized_method
+        self.allow_optimizer_fallback = bool(allow_optimizer_fallback)
 
 
 def risk_config_from_dict(d: dict) -> RiskConfig:
@@ -85,6 +96,8 @@ def risk_config_from_dict(d: dict) -> RiskConfig:
                 False,
             )
         ),
+        selection_method=str(d.get("selection_method", "greedy")),
+        allow_optimizer_fallback=bool(d.get("allow_optimizer_fallback", False)),
     )
 
 

@@ -10,7 +10,7 @@ def _make_risk_config(**kwargs) -> RiskConfig:
     defaults = dict(
         max_orders_per_day=10,
         max_gross_exposure_yen=100_000_000.0,
-        max_single_name_exposure_yen=20_000_000.0,
+        max_single_name_exposure_yen=100_000_000.0,
         max_long_exposure_yen=100_000_000.0,
         max_short_exposure_yen=100_000_000.0,
         max_net_exposure_yen=100_000_000.0,
@@ -23,7 +23,7 @@ def _make_risk_config(**kwargs) -> RiskConfig:
 
 def test_optimize_orders_no_candidates():
     risk = _make_risk_config()
-    selected, diag = optimize_orders([], risk)
+    selected, rejected, diag = optimize_orders([], risk)
     assert selected == []
     assert diag.n_candidates == 0
 
@@ -35,7 +35,7 @@ def test_optimize_orders_simple():
         {"code": "1003", "side": "BUY", "score": 0.5, "entry_value": 500_000},
     ]
     risk = _make_risk_config()
-    selected, diag = optimize_orders(candidates, risk)
+    selected, rejected, diag = optimize_orders(candidates, risk)
     assert len(selected) > 0
     assert isinstance(diag, OptimizationDiagnostics)
 
@@ -46,8 +46,9 @@ def test_optimize_orders_order_limit():
         for i in range(20)
     ]
     risk = _make_risk_config(max_orders_per_day=3)
-    selected, diag = optimize_orders(candidates, risk)
+    selected, rejected, diag = optimize_orders(candidates, risk)
     assert len(selected) <= 3
+    assert len(selected) + len(rejected) == 20
 
 
 def test_optimize_orders_gross_limit():
@@ -56,25 +57,25 @@ def test_optimize_orders_gross_limit():
         {"code": "1002", "side": "BUY", "score": 0.9, "entry_value": 80_000_000},
     ]
     risk = _make_risk_config(max_gross_exposure_yen=100_000_000)
-    selected, diag = optimize_orders(candidates, risk)
+    selected, rejected, diag = optimize_orders(candidates, risk)
     assert len(selected) <= 1
 
 
 def test_optimize_orders_with_existing():
     candidates = [
-        {"code": "1001", "side": "BUY", "score": 1.0, "entry_value": 60_000_000},
+        {"code": "1001", "side": "BUY", "score": 1.0, "entry_value": 30_000_000},
     ]
     risk = _make_risk_config(max_long_exposure_yen=100_000_000, max_gross_exposure_yen=100_000_000)
-    selected, diag = optimize_orders(candidates, risk, existing_long=50_000_000)
+    selected, rejected, diag = optimize_orders(candidates, risk, existing_long=50_000_000)
     assert len(selected) == 1
 
 
 def test_optimize_orders_existing_blocks():
     candidates = [
-        {"code": "1001", "side": "BUY", "score": 1.0, "entry_value": 60_000_000},
+        {"code": "1001", "side": "BUY", "score": 1.0, "entry_value": 30_000_000},
     ]
-    risk = _make_risk_config(max_long_exposure_yen=100_000_000)
-    selected, diag = optimize_orders(candidates, risk, existing_long=60_000_000)
+    risk = _make_risk_config(max_long_exposure_yen=100_000_000, max_gross_exposure_yen=100_000_000)
+    selected, rejected, diag = optimize_orders(candidates, risk, existing_long=60_000_000)
     assert len(selected) == 1
 
 
