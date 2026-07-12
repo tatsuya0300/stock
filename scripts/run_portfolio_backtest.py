@@ -13,14 +13,13 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
 
-from jp_signal.config import load_config, ConfigError
-from jp_signal.storage import Storage
+from jp_signal.config import ConfigError, load_config
 from jp_signal.portfolio import PortfolioBacktester
+from jp_signal.storage import Storage
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +95,16 @@ def main() -> None:
 
     data_cfg = cfg["data"]
     vintage_mode = str(data_cfg.get("price_vintage_mode", "latest_snapshot"))
+
+    if vintage_mode == "point_in_time":
+        raise ConfigError(
+            "scripts/run_portfolio_backtest.py の "
+            "point_in_time モードは、現時点では "
+            "ポートフォリオ状態を日次で引き継げません。"
+            "不正確なPnL生成を防ぐため実行を中止します。"
+            "stateful step-based backtester実装後に"
+            "再度有効化してください。"
+        )
 
     # --- load orders ---
     log.info("Loading orders...")
@@ -268,7 +277,7 @@ def main() -> None:
         )
 
     # --- output ---
-    out_dir = Path(cfg.get("output", {}).get("dir", "output"))
+    out_dir = Path(bt_cfg.get("output_dir", "./data/bt_out"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if result.trades is not None and not result.trades.empty:

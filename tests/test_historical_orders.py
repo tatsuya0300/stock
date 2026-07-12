@@ -43,31 +43,65 @@ def test_generate_historical_orders_empty_dates():
 
 
 def test_generate_historical_orders_with_one_date():
+    """minimal smoke test: our implementation actually calls the model factory
+    and produces both diagnostics and (possibly empty/failed) orders."""
     calls = []
+
+    class DummyModel:
+        def generate(self, prices, as_of):
+            return pd.DataFrame(
+                {"code": ["1001"], "side": ["BUY"], "score": [1.0]}
+            )
 
     def dummy_model_factory(cfg):
         calls.append(cfg)
-
-        class DummyModel:
-            def generate(self, prices, as_of):
-                return pd.DataFrame({"code": ["1001"], "side": ["BUY"], "score": [1.0]})
-
         return DummyModel()
 
     def dummy_price_loader(codes, start, end):
-        return pd.DataFrame({"code": ["1001"], "date": [str(start)], "close": [100.0]})
+        rows = []
+        for code in codes:
+            for d in pd.bdate_range(
+                end=pd.Timestamp(end) - pd.Timedelta(days=1), periods=30
+            ):
+                rows.append(
+                    {
+                        "code": code,
+                        "date": d.strftime("%Y-%m-%d"),
+                        "open": 100.0,
+                        "high": 110.0,
+                        "low": 90.0,
+                        "close": 105.0,
+                        "adj_open": 100.0,
+                        "adj_high": 110.0,
+                        "adj_low": 90.0,
+                        "adj_close": 105.0,
+                        "volume": 1_000_000,
+                        "turnover": 105_000_000,
+                    }
+                )
+        return pd.DataFrame(rows)
 
     def dummy_universe_loader(as_of):
-        return pd.DataFrame({"code": ["1001"]})
+        return pd.DataFrame({"code": ["1001"], "name": ["Test"]})
 
     result = generate_historical_orders(
         trading_dates=[date(2026, 7, 10)],
         model_factory=dummy_model_factory,
         price_loader=dummy_price_loader,
         universe_loader=dummy_universe_loader,
-        model_cfg={"lookback": 20, "top_n": 5},
-        sizing_cfg={},
-        risk_cfg={},
+        model_cfg={"lookback": 5},
+        sizing_cfg={
+            "adv_ratio": 0.001,
+            "adv_ratio_cap": 0.002,
+            "adv_window": 20,
+            "min_adv_periods": 20,
+            "require_full_adv_history": True,
+        },
+        risk_cfg={
+            "require_both_sides": False,
+            "max_orders_per_day": 10,
+            "max_gross_exposure_yen": 100_000_000,
+        },
     )
     assert result.diagnostics["dates_processed"] == 1
     assert len(calls) == 1
