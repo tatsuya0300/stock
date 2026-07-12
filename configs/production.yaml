@@ -1,10 +1,11 @@
 data:
   source: "jquants"
-  db_path: "./data/jp_signal.sqlite"
+  db_path: "../data/jp_signal.sqlite"
   allow_approximate_turnover: false
+  jquants_plan: "standard"
 
 universe:
-  file: "./data/topix500.csv"
+  file: "../data/topix500.csv"
 
 model:
   lookback: 5
