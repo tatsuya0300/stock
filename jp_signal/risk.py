@@ -49,7 +49,12 @@ class RiskConfig:
         }
 
         for name, value in non_negative_limits.items():
-            if float(value) < 0:
+            numeric_value = float(value)
+
+            if not isfinite(numeric_value):
+                raise ValueError(f"{name} must be finite: {value}")
+
+            if numeric_value < 0:
                 raise ValueError(f"{name} must be >= 0: {value}")
 
         self.max_orders_per_day = int(max_orders_per_day)
@@ -117,6 +122,14 @@ def select_orders_with_reasons(
         errors="coerce",
     ).fillna(0.0)
 
+    if "risk_value_yen" not in out.columns:
+        out["risk_value_yen"] = out["value_yen"]
+    else:
+        out["risk_value_yen"] = pd.to_numeric(
+            out["risk_value_yen"],
+            errors="coerce",
+        )
+
     if score_col not in out.columns:
         out[score_col] = 0.0
 
@@ -167,6 +180,14 @@ def select_orders_with_reasons(
 
         if not pd.notna(value) or value <= 0:
             reject(row, "INVALID_VALUE_YEN")
+            continue
+
+        if not isfinite(value):
+            reject(row, "NON_FINITE_VALUE_YEN")
+            continue
+
+        if not isfinite(risk_value):
+            reject(row, "NON_FINITE_RISK_VALUE_YEN")
             continue
 
         if risk_value > risk.max_single_name_exposure_yen:
@@ -368,11 +389,6 @@ def apply_order_risk_limits(
     select_orders_with_reasons() を使用する。
     """
     return select_orders_with_reasons(
-        orders,
-        risk,
-        score_col=score_col,
-    ).selected
-return select_orders_with_reasons(
         orders,
         risk,
         score_col=score_col,
