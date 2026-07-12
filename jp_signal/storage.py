@@ -351,11 +351,17 @@ class Storage:
         source: str,
         available_at: str | None = None,
     ) -> int:
-        """プライベートメソッド: 呼び出し側トランザクション内で使用すること。"""
+        """プライベートメソッド: 呼び出し側トランザクション内で使用すること。
+        
+        available_at が None の場合は fetched_at と同じ値を使用する（NULL 禁止）。
+        """
         if df is None or df.empty:
             return 0
 
         fetched_at = _utc_now_iso()
+        # available_at 未指定時は fetched_at で補完（NULL を書き込まない）
+        if available_at is None:
+            available_at = fetched_at
         x = df.copy()
         x["code"] = x["code"].astype(str).str.strip()
         x["date"] = pd.to_datetime(x["date"]).dt.strftime("%Y-%m-%d")

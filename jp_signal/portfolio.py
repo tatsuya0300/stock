@@ -92,6 +92,7 @@ class PortfolioBacktester:
         adv_window: int = 20,
         min_adv_periods: int = 20,
         require_liquidity_data: bool = True,
+        maintain_margin_ratio: float = 0.25,
     ):
         if initial_capital <= 0:
             raise ValueError(f"initial_capital must be > 0: {initial_capital}")
@@ -102,6 +103,10 @@ class PortfolioBacktester:
         if min_adv_periods > adv_window:
             raise ValueError(
                 f"min_adv_periods ({min_adv_periods}) must be <= adv_window ({adv_window})"
+            )
+        if not 0 < maintain_margin_ratio <= 1.0:
+            raise ValueError(
+                f"maintain_margin_ratio must be in (0, 1]: {maintain_margin_ratio}"
             )
 
         self.initial_capital = float(initial_capital)
@@ -116,6 +121,7 @@ class PortfolioBacktester:
         self.adv_window = max(1, int(adv_window))
         self.min_adv_periods = max(1, int(min_adv_periods))
         self.require_liquidity_data = bool(require_liquidity_data)
+        self.maintain_margin_ratio = float(maintain_margin_ratio)
 
     # ----------------------------------------------------------------
     # static helpers

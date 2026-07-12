@@ -66,9 +66,27 @@ _INITIAL_HISTORY_CALENDAR_DAYS = 400
 
 
 def make_datasource(cfg: dict):
-    if cfg["data"]["source"] == "jquants":
-        return JQuantsSource(cfg["data"]["jquants_api_key"])
-    return YFinanceSource()
+    data_cfg = cfg.get("data", {})
+    source = str(data_cfg.get("source", "")).strip().lower()
+
+    if source == "jquants":
+        raw_sleep_sec = data_cfg.get("jquants_sleep_sec")
+        sleep_sec: float | None = None if raw_sleep_sec is None else float(raw_sleep_sec)
+
+        return JQuantsSource(
+            api_key=str(data_cfg.get("jquants_api_key", "")),
+            plan=str(data_cfg.get("jquants_plan", "free")),
+            sleep_sec=sleep_sec,
+            strict_data_quality=bool(data_cfg.get("strict_data_quality", True)),
+        )
+
+    if source == "yfinance":
+        return YFinanceSource(
+            strict_data_quality=bool(data_cfg.get("strict_data_quality", False)),
+            chunk_size=int(data_cfg.get("yfinance_chunk_size", 50)),
+        )
+
+    raise ValueError(f"unsupported data source: {source!r}")
 
 
 def make_notifier(cfg: dict):

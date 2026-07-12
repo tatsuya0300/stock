@@ -15,6 +15,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from .jquants_limits import resolve_jquants_sleep_sec
+
 try:
     import yaml
 except ImportError:
@@ -36,6 +38,17 @@ _DEFAULT_RISK = {
 _DEFAULT_DATA = {
     # yfinance 近似 turnover を sizing/impact に使うことを明示許可するか
     "allow_approximate_turnover": False,
+
+    # J-Quants 設定
+    "jquants_plan": "free",
+    # None なら契約プラン別の最小安全間隔を使用する
+    "jquants_sleep_sec": None,
+
+    # datasource 段階でデータ品質を厳格に検証する
+    "strict_data_quality": True,
+
+    # yfinance の一括取得銘柄数
+    "yfinance_chunk_size": 50,
 }
 
 _DEFAULT_BACKTEST = {
@@ -237,11 +250,34 @@ def load_config(path: str = "config.yaml") -> dict:
 
 def _validate_config_values(cfg: dict) -> None:
     """実行前に設定値の意味的整合性を検証する。"""
+    data = cfg["data"]
     backtest = cfg["backtest"]
     sizing = cfg["sizing"]
     risk = cfg.get("risk", {})
     model = cfg.get("model", {})
     data_quality = cfg.get("data_quality", {})
+
+    source = str(data.get("source", "")).strip().lower()
+
+    if source == "jquants":
+        raw_sleep_sec = data.get("jquants_sleep_sec")
+        sleep_sec = None if raw_sleep_sec is None else _as_float(data, "jquants_sleep_sec", section="data")
+
+        try:
+            normalized_plan, resolved_sleep_sec = resolve_jquants_sleep_sec(
+                plan=str(data.get("jquants_plan", "free")),
+                sleep_sec=sleep_sec,
+            )
+        except ValueError as exc:
+            raise ConfigError(f"J-Quants rate-limit設定が不正です: {exc}") from exc
+
+        # 後続処理で同じ値を利用できるよう正規化する
+        data["jquants_plan"] = normalized_plan
+        data["jquants_sleep_sec"] = resolved_sleep_sec
+
+    yfinance_chunk_size = _as_int(data, "yfinance_chunk_size", section="data", default=50)
+    if yfinance_chunk_size < 1:
+        raise ConfigError(f"data.yfinance_chunk_size は1以上である必要があります: {yfinance_chunk_size}")
 
     if "start" in backtest and "end" in backtest:
         try:

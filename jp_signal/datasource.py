@@ -24,20 +24,14 @@ from typing import Any
 import pandas as pd
 
 from .data_quality import REQUIRED_PRICE_COLS, validate_prices
+from .jquants_limits import resolve_jquants_sleep_sec
 from .universe import normalize_code
 
 log = logging.getLogger(__name__)
 
 OUTPUT_COLS = REQUIRED_PRICE_COLS
 
-# J-Quants プラン別の最小リクエスト間隔（秒）。公式レート制限に合わせて保守側。
-# Free: 5 req/min → 12s、Light: 60/min → 1s、Standard: 120/min → 0.5s
-_JQUANTS_PLAN_MIN_INTERVAL_SEC: dict[str, float] = {
-    "free": 12.0,
-    "light": 1.0,
-    "standard": 0.5,
-    "premium": 0.2,
-}
+# プラン別レート制限は jquants_limits モジュールに集約
 
 
 class PriceDataSource(ABC):
@@ -353,30 +347,21 @@ class JQuantsSource(PriceDataSource):
         api_key: str,
         *,
         strict_data_quality: bool = True,
-        sleep_sec: float = 0.3,
+        sleep_sec: float | None = None,
         plan: str = "free",
     ):
         if not api_key:
             raise ValueError("JQUANTS_API_KEY is required for JQuantsSource (V2).")
 
-        plan_normalized = plan.lower().strip()
-        if plan_normalized not in _JQUANTS_PLAN_MIN_INTERVAL_SEC:
-            valid = sorted(_JQUANTS_PLAN_MIN_INTERVAL_SEC.keys())
-            raise ValueError(f"J-Quants plan must be one of {valid}: {plan!r}")
-
-        configured_sleep_sec = float(sleep_sec)
-        plan_min = _JQUANTS_PLAN_MIN_INTERVAL_SEC[plan_normalized]
-        if configured_sleep_sec < plan_min:
-            raise ValueError(
-                f"sleep_sec ({configured_sleep_sec}) must be >= {plan} plan minimum ({plan_min})"
-            )
-        max_sleep = 120.0
-        if configured_sleep_sec > max_sleep:
-            raise ValueError(f"sleep_sec ({configured_sleep_sec}) must be <= {max_sleep}")
+        normalized_plan, resolved_sleep_sec = resolve_jquants_sleep_sec(
+            plan=plan,
+            sleep_sec=sleep_sec,
+        )
 
         self.api_key = api_key
+        self.plan = normalized_plan
         self.strict_data_quality = strict_data_quality
-        self.sleep_sec = configured_sleep_sec
+        self.sleep_sec = resolved_sleep_sec
         self._last_request_ts = 0.0
         self.max_retries_on_429 = 3
         self._session = _requests_session_with_retry()
