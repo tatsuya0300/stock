@@ -315,6 +315,24 @@ def _validate_config_values(cfg: dict) -> None:
         section="backtest",
     )
 
+    require_actions = bool(backtest.get("require_corporate_actions", False))
+    actions_file = backtest.get("corporate_actions_file")
+
+    if require_actions and not actions_file:
+        raise ConfigError(
+            "backtest.require_corporate_actions=true の場合、"
+            "backtest.corporate_actions_file が必要です"
+        )
+
+    if actions_file:
+        resolved_actions = str(
+            _resolve_path(
+                str(actions_file),
+                config_path=Path(cfg["_config_path"]) if "_config_path" in cfg else Path("config.yaml"),
+            )
+        )
+        backtest["corporate_actions_file"] = resolved_actions
+
     initial_capital = _as_float(
         backtest,
         "initial_capital",
