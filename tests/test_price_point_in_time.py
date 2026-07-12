@@ -10,6 +10,7 @@ import pytest
 
 from jp_signal.storage import (
     PRICE_COLS,
+    SCHEMA_VERSION,
     Storage,
 )
 
@@ -369,7 +370,7 @@ def test_load_prices_asof_multiple_revisions_same_available_at(storage: Storage)
 # ── schema_version ──────────────────────────────────────────────────────
 
 
-def test_schema_version_is_5(storage: Storage):
-    """新規DBの schema_version が 5 であること。"""
+def test_schema_version_is_current(storage: Storage):
+    """新規DBの schema_version が現在のバージョンであること。"""
     v = storage.get_metadata("schema_version")
-    assert v == "5"
+    assert v == str(SCHEMA_VERSION)

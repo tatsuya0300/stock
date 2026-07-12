@@ -162,21 +162,72 @@ def _greedy_fallback(
         reverse=True,
     )
 
-    for c in sorted_candidates:
+    for candidate in sorted_candidates:
         if len(selected) >= risk.max_orders_per_day:
             break
-        value = float(c.get("entry_value", 0))
-        if c["side"] == "BUY":
-            if long_value + value > risk.max_long_exposure_yen:
-                continue
-            long_value += value
-        else:
-            if short_value + value > risk.max_short_exposure_yen:
-                continue
-            short_value += value
-        if long_value + short_value > risk.max_gross_exposure_yen:
+
+        value = float(
+            candidate.get("entry_value", 0)
+        )
+
+        if not np.isfinite(value) or value <= 0:
             continue
-        selected.append(c)
+
+        if (
+            value
+            > risk.max_single_name_exposure_yen
+        ):
+            continue
+
+        side = str(
+            candidate.get("side", "")
+        ).upper()
+
+        next_long = long_value
+        next_short = short_value
+
+        if side == "BUY":
+            next_long += value
+        elif side == "SELL":
+            next_short += value
+        else:
+            continue
+
+        next_gross = (
+            next_long + next_short
+        )
+        next_net = (
+            next_long - next_short
+        )
+
+        if (
+            next_long
+            > risk.max_long_exposure_yen
+        ):
+            continue
+
+        if (
+            next_short
+            > risk.max_short_exposure_yen
+        ):
+            continue
+
+        if (
+            next_gross
+            > risk.max_gross_exposure_yen
+        ):
+            continue
+
+        if (
+            abs(next_net)
+            > risk.max_net_exposure_yen
+        ):
+            continue
+
+        # 全制約通過後に状態をcommitする。
+        long_value = next_long
+        short_value = next_short
+        selected.append(candidate)
 
     return selected, OptimizationDiagnostics(
         status=-1,

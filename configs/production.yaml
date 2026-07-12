@@ -1,41 +1,76 @@
 data:
-  source: jquants
-  jquants_plan: free
-  price_vintage_mode: "point_in_time"
-  db_path: "data/stock.db"
+  source: "jquants"
+  jquants_plan: "free"
+
+  # stateful PIT backtester完成まではlatest_snapshotを使用する。
+  price_vintage_mode: "latest_snapshot"
+
+  db_path: "../data/stock.db"
   strict_data_quality: true
+  allow_approximate_turnover: false
 
 universe:
-  filter: TOPIX500
-  min_price: 50
-  max_price: 100000
+  # このファイルは本番環境でJPX公式データから作成する。
+  file: "../data/topix500.csv"
+
+model:
+  lookback: 5
+  top_n: 5
 
 backtest:
   start: "2024-01-01"
   end: "2024-12-31"
-  initial_capital: 100_000_000
+  initial_capital: 100000000
+
   impact_k_bp: 30.0
+  impact_k_is_calibrated: false
+
   annual_interest_rate: 0.02
   short_lending_rate: 0.02
-  commission_bp: 0.0
-  half_spread_bp: 0.0
+  commission_bp: 1.0
+  half_spread_bp: 5.0
+
   adv_window: 20
   min_adv_periods: 20
+  holding_days: 1
   require_liquidity_data: true
   maintain_margin_ratio: 0.25
 
-risk:
-  max_orders_per_day: 10
-  max_gross_exposure_yen: 100_000_000
-  max_single_name_exposure_yen: 20_000_000
-  max_long_exposure_yen: 100_000_000
-  max_short_exposure_yen: 100_000_000
-  max_net_exposure_yen: 100_000_000
-  allow_short_without_confirmed_shortability: false
+  allow_unconfirmed_short_in_bt: false
+  output_dir: "../data/bt_out"
 
 sizing:
   adv_ratio: 0.001
-  adv_ratio_cap: 0.01
+  adv_ratio_cap: 0.002
+  adv_window: 20
+  min_adv_periods: 20
+
+  require_full_adv_history: true
+  allow_single_day_turnover_fallback: false
+
+  market_open_unit_cap: 50
+  enforce_market_open_unit_cap: false
+
+  unit: 100
+
+risk:
+  max_orders_per_day: 10
+  max_gross_exposure_yen: 100000000
+  max_single_name_exposure_yen: 20000000
+  max_long_exposure_yen: 50000000
+  max_short_exposure_yen: 50000000
+  max_net_exposure_yen: 5000000
+
+  require_both_sides: true
+  allow_short_without_confirmed_shortability: false
+
+data_quality:
+  price_coverage_min: 0.99
+  lookback_coverage_min: 0.95
+  turnover_coverage_min: 0.99
+  hard_fail: true
 
 notify:
-  discord_webhook: ""
+  channel: "discord"
+  morning_time: "08:15"
+  closing_time: "15:00"

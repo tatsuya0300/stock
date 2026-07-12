@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from jp_signal.risk import RiskConfig
 from jp_signal.risk_optimizer import OptimizationDiagnostics, optimize_orders
 

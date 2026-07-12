@@ -136,6 +136,13 @@ CREATE TABLE IF NOT EXISTS fills (
     qty INTEGER,
     price REAL,
     note TEXT,
+    exit_date TEXT,
+    exit_price REAL,
+    exit_slippage_bp REAL,
+    holding_days INTEGER,
+    carry_cost REAL DEFAULT 0.0,
+    carry_days INTEGER DEFAULT 0,
+    pnl REAL,
     source_file_hash TEXT,
     source_row_number INTEGER,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -303,7 +310,7 @@ class Storage:
         return row is not None
 
     def _migrate(self) -> None:
-        """v1/v2 → v3 移行。"""
+        """v1/v2 → v3 移行 + v6 fills migration。"""
         if not self._table_exists("prices"):
             return
 
@@ -331,6 +338,28 @@ class Storage:
                     "SET available_at = fetched_at "
                     "WHERE available_at IS NULL"
                 )
+
+            # fills v6 columns
+            if self._table_exists("fills"):
+                fill_columns = self._table_columns("fills")
+
+                fill_migrations = {
+                    "exit_date": "TEXT DEFAULT NULL",
+                    "exit_price": "REAL DEFAULT NULL",
+                    "exit_slippage_bp": "REAL DEFAULT NULL",
+                    "holding_days": "INTEGER DEFAULT NULL",
+                    "carry_cost": "REAL DEFAULT 0.0",
+                    "carry_days": "INTEGER DEFAULT 0",
+                    "pnl": "REAL DEFAULT NULL",
+                }
+
+                for column, definition in fill_migrations.items():
+                    if column not in fill_columns:
+                        self.conn.execute(
+                            "ALTER TABLE fills "
+                            f"ADD COLUMN {column} "
+                            f"{definition}"
+                        )
 
     def _upsert_prices_no_commit(self, df: pd.DataFrame) -> None:
         """プライベートメソッド: 呼び出し側トランザクション内で使用すること。"""
@@ -873,6 +902,13 @@ class Storage:
             "qty",
             "price",
             "note",
+            "exit_date",
+            "exit_price",
+            "exit_slippage_bp",
+            "holding_days",
+            "carry_cost",
+            "carry_days",
+            "pnl",
             "source_file_hash",
             "source_row_number",
             "created_at",
