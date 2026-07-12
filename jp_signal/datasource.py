@@ -25,6 +25,12 @@ import pandas as pd
 
 from .data_quality import REQUIRED_PRICE_COLS, validate_prices
 from .jquants_limits import resolve_jquants_sleep_sec
+from .exceptions import (
+    AuthenticationError,
+    RateLimitError,
+    RequestError,
+    ResponseSchemaError,
+)
 from .universe import normalize_code
 
 log = logging.getLogger(__name__)
