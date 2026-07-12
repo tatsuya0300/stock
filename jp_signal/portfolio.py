@@ -93,6 +93,7 @@ class PortfolioBacktester:
         min_adv_periods: int = 20,
         require_liquidity_data: bool = True,
         maintain_margin_ratio: float = 0.25,
+        account_type: str = "margin",
     ):
         if initial_capital <= 0:
             raise ValueError(f"initial_capital must be > 0: {initial_capital}")
@@ -122,6 +123,7 @@ class PortfolioBacktester:
         self.min_adv_periods = max(1, int(min_adv_periods))
         self.require_liquidity_data = bool(require_liquidity_data)
         self.maintain_margin_ratio = float(maintain_margin_ratio)
+        self.account_type = account_type
 
     # ----------------------------------------------------------------
     # static helpers
@@ -546,8 +548,8 @@ class PortfolioBacktester:
     # carry cost
     # ----------------------------------------------------------------
 
-    @staticmethod
     def _accrue_carry(
+        self,
         positions: list[Position],
         current_date: pd.Timestamp,
         daily_borrow_rate: float,
@@ -571,7 +573,13 @@ class PortfolioBacktester:
                 updated.append(pos)
                 continue
 
-            rate = daily_lend_rate if pos.side == "SELL" else daily_borrow_rate
+            # SELL → lending rate, BUY → depends on account_type
+            if pos.side == "SELL":
+                rate = daily_lend_rate
+            elif self.account_type == "cash":
+                rate = 0.0
+            else:
+                rate = daily_borrow_rate
             carry = pos.entry_price * rate * cal_days * pos.qty
 
             pos.accrued_carry += carry
@@ -738,7 +746,13 @@ class PortfolioBacktester:
                 # 決済前に決済ポジションのcarryを計上（last_carry_date から決済日まで）
                 cal_days = (date - pos.last_carry_date).days
                 if cal_days > 0:
-                    rate = self.daily_lending if pos.side == "SELL" else self.daily_interest
+                    # SELL → lending rate, BUY → depends on account_type
+                    if pos.side == "SELL":
+                        rate = self.daily_lending
+                    elif self.account_type == "cash":
+                        rate = 0.0
+                    else:
+                        rate = self.daily_interest
                     carry = pos.entry_price * rate * cal_days * pos.qty
                     pos.accrued_carry += carry
                     pos.accrued_carry_days += cal_days
