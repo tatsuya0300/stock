@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""推奨バックテスト実行スクリプト。
+"""ポートフォリオバックテスト。
 
-config.yaml から設定を読み込み、PortfolioBacktester を用いて
-バックテストを実行する。
+Modes:
+    research:
+        各日の判断時点で利用可能だった価格から注文を再生成する。
 
-Usage:
-    python scripts/run_portfolio_backtest.py [--config CONFIG_PATH]
+    replay:
+        DBに保存された実際のordersを再生する。
+
+PIT設計:
+    - シグナル生成価格はdecision_at以前に利用可能だったrevisionのみ。
+    - 約定価格は当日の実際のraw OHLCを使用する。
+    - 全日分の注文を作った後、PortfolioBacktester.run()を1回だけ呼ぶ。
 """
 
 from __future__ import annotations
@@ -13,312 +19,602 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
 
 from jp_signal.config import ConfigError, load_config
+from jp_signal.corporate_actions import (
+    prepare_corporate_actions,
+)
+from jp_signal.historical_orders import (
+    generate_historical_orders,
+)
+from jp_signal.model import MeanReversionRule
 from jp_signal.portfolio import PortfolioBacktester
+from jp_signal.portfolio_metrics import (
+    summarize_portfolio_ledger,
+)
+from jp_signal.risk import risk_config_from_dict
 from jp_signal.storage import Storage
+from jp_signal.universe import load_universe
 
 log = logging.getLogger(__name__)
 
 
-def _decision_at_jst(
-    bt_end: str,
-    cfg: dict,
-) -> pd.Timestamp:
-    """バックテスト終了日の JST 営業日終了時刻を返す。
-
-    各日の注文生成時点のタイムスタンプとして使用する。
-    point_in_time モードでは、この時刻までに利用可能になった
-    price revision のみを参照する。
-    """
-    # デフォルトは当日 15:00 JST (= 06:00 UTC)
-    end_ts = pd.Timestamp(bt_end)
-
-    if end_ts.tzinfo is None:
-        end_ts = end_ts.tz_localize("Asia/Tokyo")
-
-    return end_ts.replace(hour=15, minute=0, second=0, microsecond=0)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run portfolio backtest")
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run portfolio backtest"
+    )
     parser.add_argument(
         "--config",
         default="config.yaml",
-        help="Path to config YAML file (default: config.yaml)",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--mode",
+        choices=["research", "replay"],
+        default="research",
+        help=(
+            "research=過去価格から注文を再生成、"
+            "replay=DB保存済み注文を再生"
+        ),
+    )
+    return parser.parse_args()
+
+
+def _decision_at_jst(
+    trading_date: date | str,
+    cfg: dict,
+) -> pd.Timestamp:
+    raw_time = str(
+        cfg.get("notify", {}).get(
+            "morning_time",
+            "08:15",
+        )
+    )
+
+    timestamp = pd.Timestamp(
+        f"{pd.Timestamp(trading_date).date()} "
+        f"{raw_time}"
+    )
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize(
+            "Asia/Tokyo"
+        )
+
+    return timestamp
+
+
+def _model_factory(
+    model_cfg: dict,
+) -> MeanReversionRule:
+    return MeanReversionRule(
+        lookback=int(
+            model_cfg.get("lookback", 5)
+        ),
+        top_n=int(
+            model_cfg.get("top_n", 5)
+        ),
+    )
+
+
+def _load_corporate_actions(
+    cfg: dict,
+):
+    bt_cfg = cfg.get("backtest", {})
+    path = bt_cfg.get(
+        "corporate_actions_file"
+    )
+    required = bool(
+        bt_cfg.get(
+            "require_corporate_actions",
+            False,
+        )
+    )
+
+    if not path:
+        if required:
+            raise ConfigError(
+                "require_corporate_actions=true "
+                "ですがcorporate_actions_fileがありません"
+            )
+        return []
+
+    csv_path = Path(path)
+
+    if not csv_path.exists():
+        if required:
+            raise FileNotFoundError(
+                f"corporate actions not found: "
+                f"{csv_path}"
+            )
+
+        log.warning(
+            "corporate actions file not found: %s",
+            csv_path,
+        )
+        return []
+
+    frame = pd.read_csv(
+        csv_path,
+        dtype={"code": str},
+    )
+
+    return prepare_corporate_actions(frame)
+
+
+def _write_result(
+    result,
+    cfg: dict,
+    initial_capital: float,
+) -> None:
+    output_dir = Path(
+        cfg["backtest"].get(
+            "output_dir",
+            "./data/bt_out",
+        )
+    )
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    outputs = {
+        "portfolio_trades.csv": result.trades,
+        "rejected_orders.csv": (
+            result.rejected_orders
+        ),
+        "daily_ledger.csv": (
+            result.daily_ledger
+        ),
+        "open_positions.csv": (
+            result.open_positions
+        ),
+        "corporate_action_events.csv": (
+            result.corporate_action_events
+        ),
+    }
+
+    for filename, frame in outputs.items():
+        if frame is None or frame.empty:
+            continue
+
+        path = output_dir / filename
+        frame.to_csv(path, index=False)
+        log.info(
+            "wrote %s rows=%d",
+            path,
+            len(frame),
+        )
+
+    if (
+        result.daily_ledger is not None
+        and not result.daily_ledger.empty
+    ):
+        summary = summarize_portfolio_ledger(
+            result.daily_ledger,
+            initial_capital=initial_capital,
+            risk_free_rate=float(
+                cfg["backtest"].get(
+                    "risk_free_rate",
+                    0.0,
+                )
+            ),
+        )
+
+        serializable = {
+            key: value
+            for key, value in summary.items()
+            if key
+            not in {
+                "daily_returns",
+                "equity_curve",
+            }
+        }
+
+        pd.Series(
+            serializable,
+            name="value",
+        ).to_csv(
+            output_dir / "summary.csv",
+            header=True,
+        )
+
+
+def main() -> None:
+    args = _parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format=(
+            "%(asctime)s [%(levelname)s] "
+            "%(name)s: %(message)s"
+        ),
     )
-
-    # --- config ---
-    config_path = Path(args.config)
-    if not config_path.exists():
-        log.error("Config file not found: %s", config_path)
-        sys.exit(1)
 
     try:
-        cfg = load_config(config_path)
-    except ConfigError as e:
-        log.error("Config error: %s", e)
-        sys.exit(1)
-
-    # --- storage ---
-    db_path = cfg["data"]["db_path"]
-    storage = Storage(db_path, read_only=True)
-
-    # --- parameters ---
-    bt_cfg = cfg["backtest"]
-    start_date = str(bt_cfg["start"])
-    end_date = str(bt_cfg["end"])
-    initial_capital = float(bt_cfg.get("initial_capital", 100_000_000))
-
-    risk_cfg = cfg.get("risk", {})
-    from jp_signal.risk import risk_config_from_dict
-    risk = risk_config_from_dict(risk_cfg)
-
-    impact_k_bp = float(bt_cfg.get("impact_k_bp", 30.0))
-    annual_interest_rate = float(bt_cfg.get("annual_interest_rate", 0.02))
-    annual_lending_rate = float(bt_cfg.get("short_lending_rate", 0.02))
-    commission_bp = float(bt_cfg.get("commission_bp", 0.0))
-    half_spread_bp = float(bt_cfg.get("half_spread_bp", 0.0))
-    adv_window = int(bt_cfg.get("adv_window", 20))
-    min_adv_periods = int(bt_cfg.get("min_adv_periods", 20))
-    require_liquidity = bool(bt_cfg.get("require_liquidity_data", True))
-    maintain_margin_ratio = float(bt_cfg.get("maintain_margin_ratio", 0.25))
-
-    data_cfg = cfg["data"]
-    vintage_mode = str(data_cfg.get("price_vintage_mode", "latest_snapshot"))
-
-    if vintage_mode == "point_in_time":
-        raise ConfigError(
-            "scripts/run_portfolio_backtest.py の "
-            "point_in_time モードは、現時点では "
-            "ポートフォリオ状態を日次で引き継げません。"
-            "不正確なPnL生成を防ぐため実行を中止します。"
-            "stateful step-based backtester実装後に"
-            "再度有効化してください。"
+        cfg = load_config(args.config)
+    except Exception as exc:
+        log.error(
+            "config load failed: %s",
+            exc,
         )
+        raise
 
-    # --- load orders ---
-    log.info("Loading orders...")
-    orders = storage.load_orders(start=start_date, end=end_date)
-    if orders.empty:
-        log.warning("No orders found for period %s - %s", start_date, end_date)
-    else:
-        log.info("Loaded %d orders", len(orders))
-
-    # --- load prices ---
-    codes: list[str] = []
-    if not orders.empty:
-        codes = sorted(orders["code"].astype(str).unique().tolist())
-
-    load_start = pd.Timestamp(start_date) - pd.Timedelta(days=adv_window + 10)
-
-    log.info(
-        "Loading prices (mode=%s, codes=%d, range=%s to %s)...",
-        vintage_mode,
-        len(codes),
-        load_start.date(),
-        end_date,
+    bt_cfg = cfg["backtest"]
+    sizing_cfg = cfg["sizing"]
+    risk_dict = dict(
+        cfg.get("risk", {})
     )
 
-    if vintage_mode == "point_in_time":
-        # BT終了日時点で利用可能だったリビジョンで一括取得
-        decision_ts = _decision_at_jst(end_date, cfg)
-        prices = storage.load_prices_for_backtest(
-            codes=codes,
-            start=load_start.isoformat(),
-            end=end_date,
-            decision_at=decision_ts.tz_convert("UTC").isoformat(),
-            vintage_mode=vintage_mode,
+    start_date = pd.Timestamp(
+        bt_cfg["start"]
+    ).date()
+    end_date = pd.Timestamp(
+        bt_cfg["end"]
+    ).date()
+
+    if start_date > end_date:
+        raise ConfigError(
+            "backtest.start must be <= end"
         )
-    else:
-        prices = storage.load_prices(
+
+    initial_capital = float(
+        bt_cfg.get(
+            "initial_capital",
+            100_000_000,
+        )
+    )
+
+    risk = risk_config_from_dict(
+        risk_dict
+    )
+
+    db_path = cfg["data"]["db_path"]
+
+    with Storage(
+        db_path,
+        read_only=True,
+    ) as storage:
+        all_universe = load_universe(
+            cfg["universe"]
+        )
+        codes = (
+            all_universe["code"]
+            .astype(str)
+            .drop_duplicates()
+            .tolist()
+        )
+
+        adv_window = int(
+            bt_cfg.get(
+                "adv_window",
+                20,
+            )
+        )
+        model_lookback = int(
+            cfg.get("model", {}).get(
+                "lookback",
+                5,
+            )
+        )
+
+        warmup_days = (
+            max(
+                adv_window,
+                model_lookback,
+            )
+            * 3
+        )
+
+        load_start = (
+            start_date
+            - timedelta(
+                days=warmup_days
+            )
+        )
+
+        # 執行価格は最終的に確定したraw OHLCを使う。
+        execution_prices = storage.load_prices(
             codes,
             load_start.isoformat(),
-            end_date,
+            end_date.isoformat(),
         )
 
-    log.info("Loaded %d price rows", len(prices))
-
-    # --- run backtest ---
-    log.info("Running backtest %s -> %s ...", start_date, end_date)
-
-    bt = PortfolioBacktester(
-        initial_capital=initial_capital,
-        risk=risk,
-        impact_k_bp=impact_k_bp,
-        annual_interest_rate=annual_interest_rate,
-        annual_lending_rate=annual_lending_rate,
-        commission_bp=commission_bp,
-        half_spread_bp=half_spread_bp,
-        adv_window=adv_window,
-        min_adv_periods=min_adv_periods,
-        require_liquidity_data=require_liquidity,
-        maintain_margin_ratio=maintain_margin_ratio,
-    )
-
-    if vintage_mode == "point_in_time" and not orders.empty:
-        # --- 日次 point-in-time で注文生成 ---
-        # 各取引日ごとに、その日時点で利用可能だった価格 revision で
-        # prices を絞り込んで BT を実行する
-        trading_dates = sorted(prices["date"].unique())
-        all_trades: list[pd.DataFrame] = []
-        all_rejected: list[pd.DataFrame] = []
-        all_ledger: list[pd.DataFrame] = []
-        all_open: list[pd.DataFrame] = []
-        all_ca: list[pd.DataFrame] = []
-
-        for i, d in enumerate(trading_dates):
-            day_str = str(pd.Timestamp(d).date())
-            log.debug("PIT step: %s", day_str)
-
-            day_orders = orders[orders["order_date"] == day_str]
-            if day_orders.empty:
-                continue
-
-            # 当日時点のPIT価格を取得
-            decision_ts = _decision_at_jst(day_str, cfg)
-            day_codes: list[str] = (
-                day_orders["code"].astype(str).unique().tolist()
+        if execution_prices.empty:
+            raise RuntimeError(
+                "execution prices are empty"
             )
 
-            day_px = storage.load_prices_asof(
-                asof_date=decision_ts.tz_convert("UTC").isoformat(),
-                codes=day_codes,
-                start=load_start.isoformat(),
-                end=day_str,
-            )
+        execution_prices["date"] = (
+            pd.to_datetime(
+                execution_prices["date"]
+            ).dt.strftime("%Y-%m-%d")
+        )
 
-            if day_px.empty:
-                log.warning("No PIT prices for %s, skipping", day_str)
-                continue
-
-            # 全履歴価格とマージ（当日以前の全ての価格が必要）
-            full_px = prices[
-                (prices["code"].isin(day_codes))
-                & (prices["date"] <= day_str)
-            ]
-
-            # PIT価格で上書き
-            combined = full_px.copy()
-            for _, pit_row in day_px.iterrows():
-                mask = (
-                    (combined["code"] == pit_row["code"])
-                    & (combined["date"] == pit_row["date"])
+        trading_dates = sorted(
+            {
+                pd.Timestamp(value).date()
+                for value in execution_prices["date"]
+                if (
+                    start_date
+                    <= pd.Timestamp(value).date()
+                    <= end_date
                 )
-                if mask.any():
-                    for col in [
-                        "open", "high", "low", "close",
-                        "adj_open", "adj_high", "adj_low", "adj_close",
-                        "volume", "turnover",
-                    ]:
-                        combined.loc[mask, col] = pit_row[col]
-                else:
-                    combined = pd.concat(
-                        [combined, pit_row.to_frame().T], ignore_index=True
+            }
+        )
+
+        if not trading_dates:
+            raise RuntimeError(
+                "no trading dates in test window"
+            )
+
+        if args.mode == "replay":
+            orders = storage.load_orders(
+                start=start_date.isoformat(),
+                end=end_date.isoformat(),
+            )
+
+            if not orders.empty:
+                orders = orders.rename(
+                    columns={
+                        "order_date": "date",
+                    }
+                )
+                orders["holding_days"] = int(
+                    bt_cfg.get(
+                        "holding_days",
+                        1,
+                    )
+                )
+
+        else:
+            vintage_mode = str(
+                cfg["data"].get(
+                    "price_vintage_mode",
+                    "latest_snapshot",
+                )
+            )
+
+            def price_loader(
+                requested_codes: list[str],
+                history_start: date,
+                decision_date: date,
+            ) -> pd.DataFrame:
+                if (
+                    vintage_mode
+                    == "point_in_time"
+                ):
+                    decision_at = (
+                        _decision_at_jst(
+                            decision_date,
+                            cfg,
+                        )
                     )
 
-            if i == 0:
-                # 最初の日のみフルBT（初期状態から）
-                result = bt.run(
-                    day_orders,
-                    combined,
-                    start_date=day_str,
-                    end_date=day_str,
+                    return storage.load_prices_asof(
+                        asof_date=(
+                            decision_at
+                            .tz_convert("UTC")
+                            .isoformat()
+                        ),
+                        codes=requested_codes,
+                        start=(
+                            history_start
+                            .isoformat()
+                        ),
+                        end=(
+                            decision_date
+                            .isoformat()
+                        ),
+                    )
+
+                return storage.load_prices(
+                    requested_codes,
+                    history_start.isoformat(),
+                    decision_date.isoformat(),
                 )
-            else:
-                result = bt.run(
-                    day_orders,
-                    combined,
-                    start_date=day_str,
-                    end_date=day_str,
+
+            def shortability_loader(
+                requested_codes: list[str],
+                decision_at: pd.Timestamp,
+            ) -> pd.DataFrame:
+                return (
+                    storage
+                    .load_shortability_observations(
+                        requested_codes,
+                        available_before=(
+                            decision_at
+                        ),
+                        available_after=(
+                            decision_at
+                            - pd.Timedelta(
+                                days=30
+                            )
+                        ),
+                    )
                 )
 
-            if result.trades is not None and not result.trades.empty:
-                all_trades.append(result.trades)
-            if result.rejected_orders is not None and not result.rejected_orders.empty:
-                all_rejected.append(result.rejected_orders)
-            if result.daily_ledger is not None and not result.daily_ledger.empty:
-                all_ledger.append(result.daily_ledger)
-            if result.open_positions is not None and not result.open_positions.empty:
-                all_open.append(result.open_positions)
-            if result.corporate_action_events is not None and not result.corporate_action_events.empty:
-                all_ca.append(result.corporate_action_events)
+            historical = (
+                generate_historical_orders(
+                    trading_dates=trading_dates,
+                    model_factory=(
+                        _model_factory
+                    ),
+                    price_loader=(
+                        price_loader
+                    ),
+                    shortability_loader=(
+                        shortability_loader
+                    ),
+                    universe_loader=(
+                        lambda as_of:
+                        load_universe(
+                            cfg["universe"],
+                            as_of=as_of,
+                        )
+                    ),
+                    model_cfg=cfg.get(
+                        "model",
+                        {},
+                    ),
+                    sizing_cfg=sizing_cfg,
+                    risk_cfg=risk_dict,
+                    holding_days=int(
+                        bt_cfg.get(
+                            "holding_days",
+                            1,
+                        )
+                    ),
+                    unit=int(
+                        sizing_cfg.get(
+                            "unit",
+                            100,
+                        )
+                    ),
+                    decision_time=str(
+                        cfg.get(
+                            "notify",
+                            {},
+                        ).get(
+                            "morning_time",
+                            "08:15",
+                        )
+                    ),
+                    shortability_max_age_days=int(
+                        risk_dict.get(
+                            "shortability_max_age_days",
+                            4,
+                        )
+                    ),
+                    fail_fast=True,
+                )
+            )
 
-        result_trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-        result_rejected = pd.concat(all_rejected, ignore_index=True) if all_rejected else pd.DataFrame()
-        result_ledger = pd.concat(all_ledger, ignore_index=True) if all_ledger else pd.DataFrame()
-        result_open = pd.concat(all_open, ignore_index=True) if all_open else pd.DataFrame()
-        result_ca = pd.concat(all_ca, ignore_index=True) if all_ca else pd.DataFrame()
+            orders = historical.orders
 
-        from jp_signal.portfolio import PortfolioResult
-        result = PortfolioResult(
-            trades=result_trades,
-            rejected_orders=result_rejected,
-            daily_ledger=result_ledger,
-            open_positions=result_open,
-            corporate_action_events=result_ca,
+            log.info(
+                "historical order diagnostics: %s",
+                historical.diagnostics,
+            )
+
+            if (
+                historical.rejections
+                is not None
+                and not historical.rejections.empty
+            ):
+                rejection_output = Path(
+                    bt_cfg.get(
+                        "output_dir",
+                        "./data/bt_out",
+                    )
+                )
+                rejection_output.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+                historical.rejections.to_csv(
+                    rejection_output
+                    / "order_build_rejections.csv",
+                    index=False,
+                )
+
+        if orders is None:
+            orders = pd.DataFrame()
+
+        corporate_actions = (
+            _load_corporate_actions(cfg)
         )
-    else:
-        # --- 一括実行（latest_snapshot モード） ---
-        result = bt.run(
+
+        backtester = PortfolioBacktester(
+            initial_capital=initial_capital,
+            risk=risk,
+            impact_k_bp=float(
+                bt_cfg.get(
+                    "impact_k_bp",
+                    30.0,
+                )
+            ),
+            annual_interest_rate=float(
+                bt_cfg.get(
+                    "annual_interest_rate",
+                    0.02,
+                )
+            ),
+            annual_lending_rate=float(
+                bt_cfg.get(
+                    "short_lending_rate",
+                    0.02,
+                )
+            ),
+            commission_bp=float(
+                bt_cfg.get(
+                    "commission_bp",
+                    0.0,
+                )
+            ),
+            half_spread_bp=float(
+                bt_cfg.get(
+                    "half_spread_bp",
+                    0.0,
+                )
+            ),
+            adv_window=adv_window,
+            min_adv_periods=int(
+                bt_cfg.get(
+                    "min_adv_periods",
+                    20,
+                )
+            ),
+            require_liquidity_data=bool(
+                bt_cfg.get(
+                    "require_liquidity_data",
+                    True,
+                )
+            ),
+            maintain_margin_ratio=float(
+                bt_cfg.get(
+                    "maintain_margin_ratio",
+                    0.25,
+                )
+            ),
+            account_type=str(
+                bt_cfg.get(
+                    "account_type",
+                    "margin",
+                )
+            ),
+        )
+
+        # 重要：全期間を1回だけ実行する。
+        result = backtester.run(
             orders,
-            prices,
-            start_date=start_date,
-            end_date=end_date,
+            execution_prices,
+            start_date=(
+                start_date.isoformat()
+            ),
+            end_date=(
+                end_date.isoformat()
+            ),
+            corporate_actions=(
+                corporate_actions
+            ),
         )
 
-    # --- output ---
-    out_dir = Path(bt_cfg.get("output_dir", "./data/bt_out"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if result.trades is not None and not result.trades.empty:
-        trades_path = out_dir / "trades.csv"
-        result.trades.to_csv(trades_path, index=False)
-        log.info("Trades saved: %s (%d rows)", trades_path, len(result.trades))
-
-    if result.rejected_orders is not None and not result.rejected_orders.empty:
-        rejected_path = out_dir / "rejected_orders.csv"
-        result.rejected_orders.to_csv(rejected_path, index=False)
-        log.info("Rejected orders saved: %s (%d rows)", rejected_path, len(result.rejected_orders))
-
-    if result.daily_ledger is not None and not result.daily_ledger.empty:
-        ledger_path = out_dir / "daily_ledger.csv"
-        result.daily_ledger.to_csv(ledger_path, index=False)
-        log.info("Daily ledger saved: %s (%d rows)", ledger_path, len(result.daily_ledger))
-
-    if result.open_positions is not None and not result.open_positions.empty:
-        open_path = out_dir / "open_positions.csv"
-        result.open_positions.to_csv(open_path, index=False)
-        log.info("Open positions saved: %s (%d rows)", open_path, len(result.open_positions))
-
-    if result.corporate_action_events is not None and not result.corporate_action_events.empty:
-        ca_path = out_dir / "corporate_action_events.csv"
-        result.corporate_action_events.to_csv(ca_path, index=False)
-        log.info("CA events saved: %s (%d rows)", ca_path, len(result.corporate_action_events))
-
-    # --- summary ---
-    if result.daily_ledger is not None and not result.daily_ledger.empty:
-        final_nav = result.daily_ledger.iloc[-1]["nav"]
-        total_return = (final_nav / initial_capital - 1) * 100
-        n_trades = len(result.trades) if result.trades is not None else 0
-        log.info(
-            "Backtest complete: NAV=%.2f return=%.2f%% trades=%d",
-            final_nav,
-            total_return,
-            n_trades,
-        )
-
-    storage.close()
+    _write_result(
+        result,
+        cfg,
+        initial_capital,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        log.exception(
+            "portfolio backtest failed"
+        )
+        sys.exit(1)
