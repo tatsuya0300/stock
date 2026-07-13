@@ -89,15 +89,8 @@ def _decision_at_jst(
 
 def _model_factory(
     model_cfg: dict,
-) -> MeanReversionRule:
-    return MeanReversionRule(
-        lookback=int(
-            model_cfg.get("lookback", 5)
-        ),
-        top_n=int(
-            model_cfg.get("top_n", 5)
-        ),
-    )
+) -> "SignalModel":
+    return model_from_config(model_cfg)
 
 
 def _load_corporate_actions(
@@ -611,6 +604,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        log.exception(
+            "portfolio backtest failed"
+        )
+        sys.exit(1)
+":
     try:
         main()
     except Exception:

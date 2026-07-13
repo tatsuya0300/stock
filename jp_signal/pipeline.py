@@ -271,10 +271,7 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
                     end=str(as_of),
                 )
 
-        model = MeanReversionRule(
-            lookback=int(cfg.get("model", {}).get("lookback", 5)),
-            top_n=int(cfg.get("model", {}).get("top_n", 5)),
-        )
+        model = model_from_config(cfg.get("model", {}))
         sig = model.generate(df, as_of=str(as_of))
         if sig.empty:
             notifier.send("本日はシグナル生成不可", "シグナル0件")
@@ -407,6 +404,20 @@ def closing_pipeline(
             result["fills_imported"] = n_lines
             notifier.send(
                 f"[DRY-RUN] 実績取込 {as_of}",
+                f"CSV行数(概算): {n_lines}",
+            )
+
+        return result
+    finally:
+        storage.close()
+�取込 {as_of}",
+                f"CSV行数(概算): {n_lines}",
+            )
+
+        return result
+    finally:
+        storage.close()
+   f"[DRY-RUN] 実績取込 {as_of}",
                 f"CSV行数(概算): {n_lines}",
             )
 

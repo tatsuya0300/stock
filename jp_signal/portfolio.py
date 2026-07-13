@@ -54,6 +54,7 @@ class Position:
     last_carry_date: pd.Timestamp
     accrued_carry: float = 0.0
     accrued_carry_days: int = 0
+    exit_defer_days: int = 0
 
 
 @dataclass
@@ -94,6 +95,7 @@ class PortfolioBacktester:
         require_liquidity_data: bool = True,
         maintain_margin_ratio: float = 0.25,
         account_type: str = "margin",
+        max_exit_defer_days: int = 5,
     ):
         if initial_capital <= 0:
             raise ValueError(f"initial_capital must be > 0: {initial_capital}")
@@ -110,6 +112,12 @@ class PortfolioBacktester:
                 f"maintain_margin_ratio must be in (0, 1]: {maintain_margin_ratio}"
             )
 
+        if max_exit_defer_days <= 0:
+            raise ValueError(
+                "max_exit_defer_days must be > 0: "
+                f"{max_exit_defer_days}"
+            )
+
         self.initial_capital = float(initial_capital)
         self.risk = risk
         self.impact_k_bp = float(impact_k_bp)
@@ -124,6 +132,7 @@ class PortfolioBacktester:
         self.require_liquidity_data = bool(require_liquidity_data)
         self.maintain_margin_ratio = float(maintain_margin_ratio)
         self.account_type = account_type
+        self.max_exit_defer_days = int(max_exit_defer_days)
 
     # ----------------------------------------------------------------
     # static helpers
@@ -699,8 +708,31 @@ class PortfolioBacktester:
                 )
                 corporate_action_events.extend(ca_events)
 
-            # --- 1. close positions whose planned_exit_date <= date ---
-            # NOTE: carry accrual は決済後に行う（決済ポジションのcarryは決済時に計上）
+            # --- 1. accrue carry on ALL existing positions at day open ---
+            positions = self._accrue_carry(
+                positions,
+                date,
+                self.daily_interest,
+                self.daily_lending,
+            )
+
+            # --- 2. capture open exposure BEFORE exits/entries ---
+            open_exposure_before_orders = self._exposure_at_open(
+                positions, history, date
+            )
+            total_accrued_carry = (
+                sum(p.accrued_carry for p in positions)
+                if positions
+                else 0.0
+            )
+            equity_at_open = (
+                cash
+                + open_exposure_before_orders["long"]
+                - open_exposure_before_orders["short"]
+                - total_accrued_carry
+            )
+
+            # --- 3. close positions whose planned_exit_date <= date ---
             closing_positions: list[Position] = []
             remaining_positions: list[Position] = []
 
@@ -718,35 +750,92 @@ class PortfolioBacktester:
             settled_positions: list[Position] = []
 
             for pos in closing_positions:
-                # 決済日の価格を取得。欠損している場合は決済を延期
+                forced_reason: str | None = None
+
+                # 決済日の価格を取得。欠損している場合は決済を延期または強制決済
                 frame_px = history.get(str(pos.code))
                 if frame_px is None or frame_px.empty:
-                    deferred_positions.append(pos)
-                    continue
-
-                exact_available = (
-                    date in frame_px.index
-                    and np.isfinite(frame_px.loc[date, "close"])
-                    and frame_px.loc[date, "close"] > 0
-                )
-                if not exact_available:
-                    deferred_positions.append(pos)
-                    continue
-
-                exit_price_raw = float(frame_px.loc[date, "close"])
+                    deferred, forced_price, forced_reason = self._defer_or_force_close(
+                        position=pos,
+                        date=date,
+                        history=history,
+                        reason="NO_EXIT_PRICE",
+                    )
+                    if deferred:
+                        deferred_positions.append(pos)
+                        rejected_orders.append(
+                            {
+                                "code": pos.code,
+                                "name": pos.name,
+                                "side": pos.side,
+                                "qty": pos.qty,
+                                "rejection_date": str(date.date()),
+                                "reason": forced_reason,
+                            }
+                        )
+                        continue
+                    exit_price_raw = float(forced_price)
+                else:
+                    exact_available = (
+                        date in frame_px.index
+                        and np.isfinite(frame_px.loc[date, "close"])
+                        and frame_px.loc[date, "close"] > 0
+                    )
+                    if not exact_available:
+                        deferred, forced_price, forced_reason = self._defer_or_force_close(
+                            position=pos,
+                            date=date,
+                            history=history,
+                            reason="NO_EXIT_PRICE",
+                        )
+                        if deferred:
+                            deferred_positions.append(pos)
+                            rejected_orders.append(
+                                {
+                                    "code": pos.code,
+                                    "name": pos.name,
+                                    "side": pos.side,
+                                    "qty": pos.qty,
+                                    "rejection_date": str(date.date()),
+                                    "reason": forced_reason,
+                                }
+                            )
+                            continue
+                        exit_price_raw = float(forced_price)
+                    else:
+                        exit_price_raw = float(frame_px.loc[date, "close"])
 
                 exit_adv = adv_map.get(
                     (str(pos.code), date),
                     float("nan"),
                 )
-                if self.require_liquidity_data and not self._is_valid_adv(exit_adv):
-                    deferred_positions.append(pos)
-                    continue
+
+                if forced_reason is None and self.require_liquidity_data and not self._is_valid_adv(exit_adv):
+                    deferred, forced_price, forced_reason = self._defer_or_force_close(
+                        position=pos,
+                        date=date,
+                        history=history,
+                        reason="NO_EXIT_LIQUIDITY",
+                    )
+                    if deferred:
+                        deferred_positions.append(pos)
+                        rejected_orders.append(
+                            {
+                                "code": pos.code,
+                                "name": pos.name,
+                                "side": pos.side,
+                                "qty": pos.qty,
+                                "rejection_date": str(date.date()),
+                                "reason": forced_reason,
+                            }
+                        )
+                        continue
+                    exit_price_raw = float(forced_price)
+                    exit_adv = float("nan")
 
                 # 決済前に決済ポジションのcarryを計上（last_carry_date から決済日まで）
                 cal_days = (date - pos.last_carry_date).days
                 if cal_days > 0:
-                    # SELL → lending rate, BUY → depends on account_type
                     if pos.side == "SELL":
                         rate = self.daily_lending
                     elif self.account_type == "cash":
@@ -758,13 +847,25 @@ class PortfolioBacktester:
                     pos.accrued_carry_days += cal_days
                     pos.last_carry_date = date
 
-                direction = -self._side_sign(pos.side)
-                exit_price, exit_slippage_bp = self._execution_price(
-                    base_price=exit_price_raw,
-                    qty=pos.qty,
-                    adv=exit_adv,
-                    direction=direction,
-                )
+                # 強制決済時はimpactを0とする代わりに固定slippageを課す
+                if forced_reason is not None and forced_reason.endswith("_FORCED"):
+                    direction = -self._side_sign(pos.side)
+                    exit_slippage_bp = (
+                        self.half_spread_bp
+                        + self.commission_bp
+                    )
+                    exit_price = exit_price_raw * (
+                        1.0
+                        + direction * exit_slippage_bp / 10_000.0
+                    )
+                else:
+                    direction = -self._side_sign(pos.side)
+                    exit_price, exit_slippage_bp = self._execution_price(
+                        base_price=exit_price_raw,
+                        qty=pos.qty,
+                        adv=exit_adv,
+                        direction=direction,
+                    )
 
                 gross_pnl = (exit_price - pos.entry_price) * self._side_sign(pos.side) * pos.qty
                 total_carry = pos.accrued_carry
@@ -802,32 +903,14 @@ class PortfolioBacktester:
                         "gross_pnl": gross_pnl,
                         "pnl": net_pnl,
                         "score": pos.score,
+                        "exit_defer_days": pos.exit_defer_days,
+                        "forced_exit_reason": forced_reason,
                     }
                 )
 
             positions = remaining_positions + deferred_positions
 
-            # --- 2. accrue carry on remaining positions (after closing) ---
-            positions = self._accrue_carry(
-                positions,
-                date,
-                self.daily_interest,
-                self.daily_lending,
-            )
-
-            for dpos in deferred_positions:
-                rejected_orders.append(
-                    {
-                        "code": dpos.code,
-                        "name": dpos.name,
-                        "side": dpos.side,
-                        "qty": dpos.qty,
-                        "rejection_date": str(date.date()),
-                        "reason": "NO_EXIT_PRICE_DEFERRED",
-                    }
-                )
-
-            # --- 3. process new orders for this date ---
+            # --- 4. process new orders for this date ---
             day_orders = od[od["date"] == date]
             candidates: list[dict] = []
 
@@ -948,14 +1031,7 @@ class PortfolioBacktester:
                     }
                 )
 
-            # --- 4. compute open equity for risk check ---
-            # 決済後のポジションのみで寄付き時点のエクスポージャーを計算
-            open_exposure = self._exposure_at_open(positions, history, date)
-            cash_at_open = cash
-            open_accrued_carry = sum(p.accrued_carry for p in positions)
-            equity_at_open = cash_at_open + open_exposure["long"] - open_exposure["short"] - open_accrued_carry
-
-            # equity_at_open の妥当性検証
+            # --- 5. select orders using open exposure ---
             if not (np.isfinite(equity_at_open) and equity_at_open >= 0):
                 rejected_orders.append(
                     {
@@ -967,7 +1043,6 @@ class PortfolioBacktester:
                         "reason": f"INVALID_EQUITY_AT_OPEN: {equity_at_open}",
                     }
                 )
-                # equity が不正な場合は全注文を不採用にする
                 for cand in candidates:
                     rejected_orders.append(
                         {
@@ -986,7 +1061,7 @@ class PortfolioBacktester:
             else:
                 selected, day_rejected = self._select_orders(
                     candidates,
-                    open_exposure,
+                    open_exposure_before_orders,
                     equity_at_open=equity_at_open,
                     maintain_margin_ratio=self.maintain_margin_ratio,
                 )
@@ -1005,7 +1080,7 @@ class PortfolioBacktester:
                     }
                 )
 
-            # --- 5. open new positions ---
+            # --- 6. open new positions ---
             for cand in selected:
                 pos = Position(
                     position_id=self._make_position_id(
@@ -1036,16 +1111,26 @@ class PortfolioBacktester:
                     cash += cand["entry_price"] * cand["qty"]
                 positions.append(pos)
 
-            # --- 6. record daily ledger ---
+            # --- 7. record daily ledger ---
             exposure = self._exposure(positions, history, date)
             total_accrued_carry = sum(p.accrued_carry for p in positions)
             nav = cash + exposure["long"] - exposure["short"] - total_accrued_carry
 
             equity_to_gross_ratio: float | None = None
             margin_breach: bool = False
-            if exposure["gross"] > 0 and np.isfinite(equity_at_open) and equity_at_open >= 0:
-                equity_to_gross_ratio = equity_at_open / exposure["gross"]
-                margin_breach = equity_to_gross_ratio < self.maintain_margin_ratio
+            if exposure["gross"] > 0:
+                equity_to_gross_ratio = nav / exposure["gross"]
+                margin_breach = (
+                    equity_to_gross_ratio
+                    < self.maintain_margin_ratio
+                )
+
+            open_equity_to_gross_ratio: float | None = None
+            if open_exposure_before_orders["gross"] > 0:
+                open_equity_to_gross_ratio = (
+                    equity_at_open
+                    / open_exposure_before_orders["gross"]
+                )
 
             daily_ledger.append(
                 {
@@ -1058,8 +1143,17 @@ class PortfolioBacktester:
                     "open_position_count": len(positions),
                     "accrued_carry": total_accrued_carry,
                     "nav": nav,
+                    "equity_at_open": equity_at_open,
+                    "gross_exposure_at_open": (
+                        open_exposure_before_orders["gross"]
+                    ),
+                    "equity_to_gross_ratio_at_open": (
+                        open_equity_to_gross_ratio
+                    ),
                     "equity_to_gross_ratio": equity_to_gross_ratio,
-                    "minimum_equity_to_gross_ratio": self.maintain_margin_ratio,
+                    "minimum_equity_to_gross_ratio": (
+                        self.maintain_margin_ratio
+                    ),
                     "margin_breach": margin_breach,
                 }
             )

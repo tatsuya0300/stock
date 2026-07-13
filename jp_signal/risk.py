@@ -114,6 +114,14 @@ def select_orders_with_reasons(
     注意:
         厳密な数理最適化ではない。決定論的なgreedy heuristicである。
     """
+    if risk.selection_method != "greedy":
+        raise NotImplementedError(
+            "selection_method='milp' is not implemented. "
+            "Use selection_method='greedy' until the "
+            "optimization objective and solver behavior "
+            "are explicitly defined."
+        )
+
     if orders is None or orders.empty:
         empty = pd.DataFrame()
         return RiskSelectionResult(

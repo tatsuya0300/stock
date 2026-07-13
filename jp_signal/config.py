@@ -491,6 +491,33 @@ def _validate_config_values(cfg: dict) -> None:
         if lookback < 1:
             raise ConfigError(f"model.lookback は1以上である必要があります: {lookback}")
 
+    # model.type validation
+    model_type = str(
+        model.get("type", "mean_reversion")
+    ).strip().lower()
+    valid_model_types = {
+        "mean_reversion",
+        "volatility_adjusted_mean_reversion",
+        "vol_adjusted_mean_reversion",
+    }
+    if model_type not in valid_model_types:
+        raise ConfigError(
+            "model.type は"
+            f"{sorted(valid_model_types)}"
+            "のいずれかである必要があります: "
+            f"{model_type!r}"
+        )
+
+    # risk.selection_method validation
+    selection_method = str(
+        risk.get("selection_method", "greedy")
+    ).strip().lower()
+    if selection_method != "greedy":
+        raise ConfigError(
+            "risk.selection_method='milp' は未実装です。"
+            "現在は 'greedy' のみ指定できます。"
+        )
+
 
 def uses_approximate_turnover(cfg: dict) -> bool:
     """現行 data.source が近似 turnover かどうか。"""
