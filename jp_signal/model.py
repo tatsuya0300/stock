@@ -140,6 +140,19 @@ class MeanReversionConfig:
     use_sample_weights: bool = True
     top_n: int = 10
 
+    def __post_init__(self) -> None:
+        if self.lookback < 1:
+            raise ValueError(f"lookback must be >= 1: {self.lookback}")
+        if self.top_n < 1:
+            raise ValueError(f"top_n must be >= 1: {self.top_n}")
+        if self.vol_lookback < 1:
+            raise ValueError(f"vol_lookback must be >= 1: {self.vol_lookback}")
+        if not 0 <= self.min_vol_percentile < self.max_vol_percentile <= 100:
+            raise ValueError(
+                f"vol_percentile range invalid: "
+                f"min={self.min_vol_percentile} max={self.max_vol_percentile}"
+            )
+
 
 class VolatilityAdjustedMeanReversion(SignalModel):
     """ボラティリティ調整済み平均回帰シグナル（PR-1）。
@@ -247,3 +260,28 @@ class VolatilityAdjustedMeanReversion(SignalModel):
             return pd.concat([buys, sells], ignore_index=True).sort_values("score", ascending=False)
 
         return result_df
+
+
+def model_from_config(model_cfg: dict) -> SignalModel:
+    """設定 dict からモデルインスタンスを生成するファクトリ。
+
+    model_cfg の type フィールドに基づいて適切なモデルを返す:
+      - "mean_reversion" (デフォルト): MeanReversionRule
+      - "volatility_adjusted"        : VolatilityAdjustedMeanReversion
+
+    type 未指定時は MeanReversionRule を返す（後方互換）。
+    """
+    model_type = str(model_cfg.get("type", "mean_reversion")).strip().lower()
+
+    if model_type == "volatility_adjusted":
+        config = MeanReversionConfig(**{
+            k: v for k, v in model_cfg.items()
+            if k != "type"
+        })
+        return VolatilityAdjustedMeanReversion(config)
+
+    # デフォルト: mean_reversion
+    return MeanReversionRule(
+        lookback=int(model_cfg.get("lookback", 5)),
+        top_n=int(model_cfg.get("top_n", 5)),
+    )

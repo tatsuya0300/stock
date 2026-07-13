@@ -31,7 +31,7 @@ from jp_signal.corporate_actions import (
 from jp_signal.historical_orders import (
     generate_historical_orders,
 )
-from jp_signal.model import MeanReversionRule
+from jp_signal.model import model_from_config
 from jp_signal.portfolio import PortfolioBacktester
 from jp_signal.portfolio_metrics import (
     summarize_portfolio_ledger,
@@ -89,15 +89,8 @@ def _decision_at_jst(
 
 def _model_factory(
     model_cfg: dict,
-) -> MeanReversionRule:
-    return MeanReversionRule(
-        lookback=int(
-            model_cfg.get("lookback", 5)
-        ),
-        top_n=int(
-            model_cfg.get("top_n", 5)
-        ),
-    )
+):
+    return model_from_config(model_cfg)
 
 
 def _load_corporate_actions(

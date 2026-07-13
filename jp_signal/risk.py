@@ -37,7 +37,6 @@ class RiskConfig:
         require_both_sides: bool = True,
         allow_short_without_confirmed_shortability: bool = False,
         selection_method: str = "greedy",
-        allow_optimizer_fallback: bool = False,
     ):
         if max_orders_per_day < 1:
             raise ValueError(f"max_orders_per_day must be >= 1: {max_orders_per_day}")
@@ -60,9 +59,14 @@ class RiskConfig:
                 raise ValueError(f"{name} must be >= 0: {value}")
 
         normalized_method = str(selection_method).strip().lower()
-        if normalized_method not in {"greedy", "milp"}:
+        if normalized_method == "milp":
+            raise NotImplementedError(
+                "selection_method='milp' is not yet implemented. "
+                "Use selection_method='greedy' instead."
+            )
+        if normalized_method != "greedy":
             raise ValueError(
-                "selection_method must be 'greedy' or 'milp': "
+                "selection_method must be 'greedy': "
                 f"{selection_method!r}"
             )
 
@@ -77,7 +81,6 @@ class RiskConfig:
             allow_short_without_confirmed_shortability
         )
         self.selection_method = normalized_method
-        self.allow_optimizer_fallback = bool(allow_optimizer_fallback)
 
 
 def risk_config_from_dict(d: dict) -> RiskConfig:
@@ -97,7 +100,6 @@ def risk_config_from_dict(d: dict) -> RiskConfig:
             )
         ),
         selection_method=str(d.get("selection_method", "greedy")),
-        allow_optimizer_fallback=bool(d.get("allow_optimizer_fallback", False)),
     )
 
 
@@ -119,6 +121,12 @@ def select_orders_with_reasons(
         return RiskSelectionResult(
             selected=empty,
             rejected=empty,
+        )
+
+    if risk.selection_method == "milp":
+        raise NotImplementedError(
+            "selection_method='milp' is not yet implemented. "
+            "Use selection_method='greedy' instead."
         )
 
     out = orders.copy().reset_index(drop=True)
@@ -272,16 +280,15 @@ def select_orders_with_reasons(
             )
             candidate_order.extend(pair)
     else:
-        candidate_order = []
-        bi, si = 0, 0
-
-        while bi < len(buys) or si < len(sells):
-            if bi < len(buys):
-                candidate_order.append(buys[bi])
-                bi += 1
-            if si < len(sells):
-                candidate_order.append(sells[si])
-                si += 1
+        # require_both_sides=False の場合は純粋なscore降順
+        combined = buys + sells
+        combined.sort(
+            key=lambda x: (
+                -float(x.get(score_col, 0.0)),
+                int(x["_source_order"]),
+            ),
+        )
+        candidate_order = combined
 
     # 一括制約を逐次評価
     selected_rows: list[dict] = []
