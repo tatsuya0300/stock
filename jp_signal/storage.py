@@ -633,7 +633,7 @@ class Storage:
             end: 終了日（YYYY-MM-DD）。
 
         Returns:
-            PRICE_COLS を含む DataFrame。
+            PRICE_COLS + available_at, fetched_at, source を含む DataFrame。
         """
         if not codes:
             return pd.DataFrame(columns=PRICE_COLS)
@@ -646,9 +646,10 @@ class Storage:
                 code, date, open, high, low, close,
                 adj_open, adj_high, adj_low, adj_close,
                 volume, turnover,
+                available_at, fetched_at, source,
                 ROW_NUMBER() OVER (
                     PARTITION BY code, date
-                    ORDER BY fetched_at DESC
+                    ORDER BY available_at DESC, fetched_at DESC
                 ) AS rn
             FROM price_observation_values
             WHERE code IN ({placeholders})
@@ -658,7 +659,8 @@ class Storage:
         SELECT
             code, date, open, high, low, close,
             adj_open, adj_high, adj_low, adj_close,
-            volume, turnover
+            volume, turnover,
+            available_at, fetched_at, source
         FROM ranked
         WHERE rn = 1
         ORDER BY code, date
