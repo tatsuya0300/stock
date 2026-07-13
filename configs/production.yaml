@@ -35,6 +35,7 @@ backtest:
   holding_days: 1
   require_liquidity_data: true
   maintain_margin_ratio: 0.25
+  max_exit_defer_days: 5
 
   allow_unconfirmed_short_in_bt: false
   output_dir: "../data/bt_out"

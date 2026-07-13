@@ -140,6 +140,20 @@ class MeanReversionConfig:
     use_sample_weights: bool = True
     top_n: int = 10
 
+    def __post_init__(self) -> None:
+        if self.lookback < 2:
+            raise ValueError(f"lookback must be >= 2: {self.lookback}")
+        if self.vol_lookback < 2:
+            raise ValueError(f"vol_lookback must be >= 2: {self.vol_lookback}")
+        if self.z_entry < 0:
+            raise ValueError(f"z_entry must be >= 0: {self.z_entry}")
+        if self.top_n < 1:
+            raise ValueError(f"top_n must be >= 1: {self.top_n}")
+        if not 0 <= self.min_vol_percentile <= 100:
+            raise ValueError(f"min_vol_percentile must be 0-100: {self.min_vol_percentile}")
+        if not 0 <= self.max_vol_percentile <= 100:
+            raise ValueError(f"max_vol_percentile must be 0-100: {self.max_vol_percentile}")
+
 
 class VolatilityAdjustedMeanReversion(SignalModel):
     """ボラティリティ調整済み平均回帰シグナル（PR-1）。
@@ -247,3 +261,34 @@ class VolatilityAdjustedMeanReversion(SignalModel):
             return pd.concat([buys, sells], ignore_index=True).sort_values("score", ascending=False)
 
         return result_df
+
+
+def model_from_config(model_cfg: dict) -> SignalModel:
+    """設定 dict から SignalModel を生成する。"""
+    model_type = str(
+        model_cfg.get("type", "mean_reversion")
+    ).strip().lower()
+
+    if model_type == "mean_reversion":
+        return MeanReversionRule(
+            lookback=int(model_cfg.get("lookback", 5)),
+            top_n=int(model_cfg.get("top_n", 5)),
+        )
+
+    if model_type in {
+        "volatility_adjusted_mean_reversion",
+        "vol_adjusted_mean_reversion",
+    }:
+        config = MeanReversionConfig(
+            lookback=int(model_cfg.get("lookback", 20)),
+            z_entry=float(model_cfg.get("z_entry", 0.5)),
+            vol_lookback=int(model_cfg.get("vol_lookback", 60)),
+            min_vol_percentile=float(model_cfg.get("min_vol_percentile", 5.0)),
+            max_vol_percentile=float(model_cfg.get("max_vol_percentile", 95.0)),
+            top_n=int(model_cfg.get("top_n", 10)),
+        )
+        return VolatilityAdjustedMeanReversion(config)
+
+    raise ValueError(
+        f"unsupported model.type: {model_type!r}"
+    )
