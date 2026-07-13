@@ -351,7 +351,8 @@ def morning_pipeline(as_of: date, cfg: dict, dry_run: bool = False) -> pd.DataFr
         return orders
 
     finally:
-        storage.close()
+        if storage is not None:
+            storage.close()
 
 
 def closing_pipeline(
@@ -372,28 +373,32 @@ def closing_pipeline(
         log.info("non-business day: %s", as_of)
         return {"orders": 0, "fills_imported": 0}
 
-    storage = Storage(cfg["data"]["db_path"], read_only=dry_run)
+    if dry_run or not Path(cfg["data"]["db_path"]).exists():
+        storage: Storage | None = None
+    else:
+        storage = Storage(cfg["data"]["db_path"], read_only=False)
     notifier = make_notifier(cfg)
     as_of_s = str(as_of)
     result = {"orders": 0, "fills_imported": 0}
 
     try:
-        orders_df = storage.load_orders(order_date=as_of_s)
-        result["orders"] = len(orders_df)
+        if storage is not None:
+            orders_df = storage.load_orders(order_date=as_of_s)
+            result["orders"] = len(orders_df)
 
-        if orders_df.empty:
-            body = "当日注文なし（または DB 未接続）"
-        else:
-            body = format_orders(orders_df)
+            if orders_df.empty:
+                body = "当日注文なし（または DB 未接続）"
+            else:
+                body = format_orders(orders_df)
 
-        title_prefix = "[DRY-RUN] " if dry_run else ""
-        notifier.send(f"{title_prefix}引け後確認 {as_of}", body)
+            title_prefix = "[DRY-RUN] " if dry_run else ""
+            notifier.send(f"{title_prefix}引け後確認 {as_of}", body)
 
-        # fills 取込
-        if fills_csv is not None and not dry_run:
-            n = storage.import_fills_csv(fills_csv)
-            result["fills_imported"] = n
-            fills_today = storage.load_fills(trade_date=as_of_s)
+            # fills 取込
+            if fills_csv is not None and not dry_run:
+                n = storage.import_fills_csv(fills_csv)
+                result["fills_imported"] = n
+                fills_today = storage.load_fills(trade_date=as_of_s)
             notifier.send(
                 f"実績取込 {as_of}",
                 f"CSV取込: {n}件\n当日fills: {len(fills_today)}件",
@@ -412,4 +417,5 @@ def closing_pipeline(
 
         return result
     finally:
-        storage.close()
+        if storage is not None:
+            storage.close()

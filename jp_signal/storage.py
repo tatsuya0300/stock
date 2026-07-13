@@ -263,7 +263,8 @@ class Storage:
             timeout=30,
             uri=read_only,
         )
-        self.conn.execute("PRAGMA journal_mode=WAL;")
+        if not read_only:
+            self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA foreign_keys=ON;")
         if not read_only:
             self.conn.executescript(SCHEMA)
@@ -586,6 +587,8 @@ class Storage:
         """
         if df is None or df.empty:
             return
+
+        self._require_writable()
 
         with self.conn:
             self._record_price_observations_no_commit(

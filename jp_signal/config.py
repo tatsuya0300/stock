@@ -153,11 +153,12 @@ def load_config(path: str = "config.yaml") -> dict:
     if yaml is None:
         raise ImportError("PyYAML が必要です: pip install pyyaml")
 
-    p = Path(path)
+    p = Path(path).expanduser().resolve()
     if not p.exists():
-        raise FileNotFoundError(f"設定ファイルが見つかりません: {path}")
+        raise FileNotFoundError(f"設定ファイルが見つかりません: {p}")
 
-    with open(path, encoding="utf-8") as f:
+    cfg_path_str = str(p)
+    with open(p, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     if cfg is None:
@@ -227,6 +228,12 @@ def load_config(path: str = "config.yaml") -> dict:
             config_path=p,
         )
 
+    if "corporate_actions_file" in cfg.get("backtest", {}):
+        cfg["backtest"]["corporate_actions_file"] = _resolve_path(
+            cfg["backtest"]["corporate_actions_file"],
+            config_path=p,
+        )
+
     # yfinance 近似ガード
     allow_approx = bool(cfg["data"].get("allow_approximate_turnover", False))
     if source == "yfinance" and not allow_approx:
@@ -247,6 +254,8 @@ def load_config(path: str = "config.yaml") -> dict:
             "  - 本格運用: JPX公式TOPIX500構成を data/topix500.csv に配置\n"
             "  推奨列: code,name[,effective_from,effective_to]"
         )
+
+    cfg["_config_path"] = cfg_path_str
 
     _validate_config_values(cfg)
 
@@ -323,15 +332,6 @@ def _validate_config_values(cfg: dict) -> None:
             "backtest.require_corporate_actions=true の場合、"
             "backtest.corporate_actions_file が必要です"
         )
-
-    if actions_file:
-        resolved_actions = str(
-            _resolve_path(
-                str(actions_file),
-                config_path=Path(cfg["_config_path"]) if "_config_path" in cfg else Path("config.yaml"),
-            )
-        )
-        backtest["corporate_actions_file"] = resolved_actions
 
     initial_capital = _as_float(
         backtest,
