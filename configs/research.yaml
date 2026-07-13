@@ -1,0 +1,45 @@
+# Research-grade backtest configuration.
+# This config is separate from the production config and overrides nothing.
+research:
+  hypothesis_id: "MR-001"
+
+  trial_registry_enabled: true
+  trial_registry_path: "../data/research_trials.sqlite"
+
+  allow_test_reuse: false
+
+  split:
+    train_start: "2010-01-01"
+    train_end: "2018-12-31"
+
+    validation_start: "2019-01-01"
+    validation_end: "2022-12-31"
+
+    test_start: "2023-01-01"
+    test_end: "2025-12-31"
+
+  walk_forward:
+    minimum_train_days: 756
+    test_days: 252
+    step_days: 252
+    purge_days: 5
+    embargo_days: 5
+
+  statistics:
+    bootstrap_replications: 10000
+    bootstrap_block_length: 20
+    bootstrap_confidence: 0.95
+
+    pbo_partitions: 8
+    hac_max_lags: 5
+
+  acceptance:
+    minimum_observations: 756
+    minimum_trades: 500
+    minimum_net_sharpe: 0.7
+    minimum_dsr_probability: 0.95
+    maximum_pbo: 0.20
+    maximum_drawdown: 0.20
+    minimum_alpha_t_stat: 2.0
+    maximum_p95_participation: 0.02
+    maximum_test_access_count: 1
